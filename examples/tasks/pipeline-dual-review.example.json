@@ -1,0 +1,25 @@
+{
+  "pipeline_id": "skills-governance-demo",
+  "title": "Skills 治理双意见管线",
+  "continue_on_error": false,
+  "nodes": [
+    {
+      "seq": 1,
+      "worker": "arkcli",
+      "label": "治理建议（豆包视角）",
+      "profile": "agent-plan_cn-beijing_personal",
+      "max_output_tokens": 1024,
+      "timeout_seconds": 60,
+      "brief": "背景：我的 Mac 上 10 个 AI 智能体共用约 350 个 skills，刚完成中央库规范化：95 个收编进 ~/.agents/skills 中央库、188 处实体换成 symlink、14 个死链已清除、备份 15MB 可回滚。仍有 75 组重复实体、86 个与中央库版本漂移（内容不一致）未自动处理。请给出最多 5 条下一步治理建议，每条一行，用中文，直接给清单不要客套。",
+      "done_criteria": {"stdout_regex": "\\S"}
+    },
+    {
+      "seq": 2,
+      "worker": "dsh",
+      "label": "独立复核（DeepSeek 视角）",
+      "timeout_seconds": 150,
+      "brief": "以下是另一位 AI 给出的 skills 治理建议清单：\n{{prev_output}}\n请复核这份清单：1) 指出其中可能存在的风险或错误；2) 补充它遗漏的一个重要治理动作。用中文简洁回答，分两小段即可。",
+      "done_criteria": {"stdout_regex": "\\S"}
+    }
+  ]
+}

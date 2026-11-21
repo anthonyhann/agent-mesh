@@ -1,0 +1,7 @@
+{
+  "id": "003-ping-codex",
+  "worker": "codex",
+  "brief": "Reply with exactly one word: PONG. No punctuation, no explanation.",
+  "timeout_seconds": 120,
+  "done_criteria": {"stdout_regex": "PONG"}
+}

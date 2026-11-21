@@ -1,0 +1,33 @@
+{
+  "dag_id": "dag-governance-demo",
+  "title": "分叉保留风险 · 四节点 DAG（分支并行）",
+  "max_parallel": 2,
+  "continue_on_error": false,
+  "nodes": [
+    {
+      "seq": 1, "worker": "arkcli", "label": "风险素材（豆包）",
+      "profile": "agent-plan_cn-beijing_personal", "thinking": "disabled",
+      "max_output_tokens": 512, "timeout_seconds": 90,
+      "brief": "背景：本机 74 组 skills 经审定为 agent 定制分叉保留实体，中央库统一维护其余部分。请列出这种'保留分叉'策略的 2 个潜在风险点，每点一句话，中文，直接给清单。",
+      "done_criteria": {"stdout_regex": "\\S"}
+    },
+    {
+      "seq": 2, "worker": "hermes", "label": "运维检查项（Hermes）",
+      "timeout_seconds": 120, "depends_on": [1],
+      "brief": "以下是某人列出的两个风险点：\n{{prev_output}}\n请把每个风险点改写成一条可执行的运维检查项（动词开头，一句话），中文。",
+      "done_criteria": {"stdout_regex": "\\S"}
+    },
+    {
+      "seq": 3, "worker": "dsh", "label": "概率评估（DeepSeek）",
+      "timeout_seconds": 150, "depends_on": [1],
+      "brief": "以下是某人列出的两个风险点：\n{{prev_output}}\n请分别评估每个风险在一年内实际发生的概率（高/中/低），各给一句理由，中文简洁。",
+      "done_criteria": {"stdout_regex": "\\S"}
+    },
+    {
+      "seq": 4, "worker": "codex", "label": "汇总裁决（Codex）",
+      "timeout_seconds": 300, "depends_on": [2, 3],
+      "brief": "两位同事对同一组风险给出了分析：\n【运维检查项】\n{{nodes.2.output}}\n【概率评估】\n{{nodes.3.output}}\n请综合两份分析，给出一条最重要的落地行动建议（一句话）+ 一句理由，中文。",
+      "done_criteria": {"stdout_regex": "\\S"}
+    }
+  ]
+}

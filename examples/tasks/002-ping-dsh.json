@@ -1,0 +1,9 @@
+{
+  "id": "002-ping-dsh",
+  "worker": "dsh",
+  "brief": "Reply with exactly one word: PONG. No punctuation, no explanation.",
+  "timeout_seconds": 120,
+  "done_criteria": {
+    "stdout_regex": "PONG"
+  }
+}

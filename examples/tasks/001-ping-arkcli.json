@@ -1,0 +1,11 @@
+{
+  "id": "001-ping-arkcli",
+  "worker": "arkcli",
+  "profile": "agent-plan_cn-beijing_personal",
+  "brief": "Reply with exactly one word: PONG. No punctuation, no explanation.",
+  "timeout_seconds": 60,
+  "max_output_tokens": 64,
+  "done_criteria": {
+    "stdout_regex": "PONG"
+  }
+}

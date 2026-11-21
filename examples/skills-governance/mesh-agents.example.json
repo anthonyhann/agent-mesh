@@ -1,0 +1,16 @@
+{
+  "comment": "agent-mesh 共享配置：被 skills_audit.py / consolidate_skills.py / upgrade_drift.py 共同读取；新增 agent 只改这里",
+  "central": "~/.agents/skills",
+  "agents": {
+    "catpaw": "~/.catpaw/skills",
+    "catpaw-ws": "~/.catpaw/desk_default_workspace/.catpaw/skills",
+    "claude": "~/.claude/skills",
+    "workbuddy": "~/.workbuddy-ai/skills",
+    "junie": "~/.junie/skills",
+    "qwen": "~/.qwen/skills",
+    "cursor": "~/.cursor/skills",
+    "codebuddy": "~/.codebuddy/skills",
+    "opencode": "~/.config/opencode/skills",
+    "hermes": "~/.hermes/skills"
+  }
+}
