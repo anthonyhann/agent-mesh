@@ -1,0 +1,17 @@
+name: smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quick:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install zstd
+        run: brew install zstd >/dev/null 2>&1 || true
+      - name: smoke --quick（语法 + 单元，无模型调用）
+        run: ./smoke.sh --quick
