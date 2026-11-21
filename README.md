@@ -10,6 +10,13 @@
 
 ## 这是什么
 
+<p align="center">
+  <img src="docs/assets/roundtable-flow.png" alt="圆桌流转图：多家 Agent CLI 协同完成一次内容策划（每个节点是独立 fresh context）" width="820">
+</p>
+<p align="center">
+  <img src="docs/assets/dag-demo.gif" alt="DAG 并行编排演示（真实运行回放：分叉-并行-汇聚）" width="720">
+</p>
+
 你机器上装着好几个 AI 命令行工具（DeepSeek Harness、Codex、OpenCode、Hermes、ArkCLI、Claude Code……），每个都能非交互跑任务，但它们各自为政：没有统一调度、没有结果验收、没有运行记录。
 
 agent-mesh 给它们套上一层**任务单驱动**的编排层：

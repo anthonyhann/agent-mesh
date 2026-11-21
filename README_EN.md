@@ -10,6 +10,13 @@
 
 ## What is this
 
+<p align="center">
+  <img src="docs/assets/roundtable-flow.png" alt="Roundtable flow: multiple Agent CLIs collaborating on one task (each node is a fresh context)" width="820">
+</p>
+<p align="center">
+  <img src="docs/assets/dag-demo.gif" alt="DAG parallel orchestration demo (real run replay: fan-out, parallel, fan-in)" width="720">
+</p>
+
 Your machine hosts several AI CLIs (DeepSeek Harness, Codex, OpenCode, Hermes, ArkCLI, Claude Code…). Each can run headless tasks, but they operate in silos: no unified dispatch, no result verification, no run history.
 
 agent-mesh wraps them in a **task-card-driven** orchestration layer:
