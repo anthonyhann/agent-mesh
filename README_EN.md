@@ -47,6 +47,19 @@ Every worker call is a **fresh context** — the core value of multi-harness orc
 
 Adding a worker is a single `case` branch in `run_worker.sh` — see [docs/WORKERS.md](docs/WORKERS.md).
 
+## For AI Agents (three-step onboarding)
+
+The caller of agent-mesh *is* an agent — all onboarding channels are built in:
+
+1. **AGENTS.md** (repo root) — auto-read by Codex / Claude Code / Cursor; contains the shortest path and the rules
+2. **Installable Skill** — `./scripts/install-skill.sh` symlinks `skills/agent-mesh/` into every detected agent skill directory (Claude/CatPaw/OpenCode/Cursor/CodeBuddy/Qwen/Hermes…); then trigger in natural language: "dispatch X to dsh", "run a pipeline: A drafts, B reviews"
+3. **llms.txt** — a compact project digest for LLMs
+
+```bash
+./scripts/install-skill.sh --list   # preview targets
+./scripts/install-skill.sh          # install everywhere
+```
+
 ## Quick start
 
 ```bash

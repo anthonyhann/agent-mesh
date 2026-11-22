@@ -47,6 +47,19 @@ python3 mesh_board.py            # 运行看板：历史/成功率/tokens 一页
 
 新 worker 接入只需在 `run_worker.sh` 加一个 case 分支，见 [docs/WORKERS.md](docs/WORKERS.md)。
 
+## 给 AI Agent 用（三步接入）
+
+agent-mesh 的调用方就是 Agent，接入通道全铺好：
+
+1. **AGENTS.md**（根目录）——Codex / Claude Code / Cursor 等进入仓库自动读取，含最短上手路径与纪律
+2. **可安装 Skill**——`./scripts/install-skill.sh` 把 `skills/agent-mesh/` 以 symlink 装进本机所有 Agent 的技能目录（Claude/CatPaw/OpenCode/Cursor/CodeBuddy/Qwen/Hermes…），装完即可用自然语言触发：「派单给 dsh 做 X」「跑个管线 A 起草 B 复核」
+3. **llms.txt**——LLM 专用的项目速读文件
+
+```bash
+./scripts/install-skill.sh --list   # 先看会装到哪
+./scripts/install-skill.sh          # 一键安装
+```
+
 ## 快速开始
 
 ```bash

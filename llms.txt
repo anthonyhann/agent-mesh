@@ -1,0 +1,31 @@
+# agent-mesh
+
+> Orchestrate multiple Agent CLIs into a dispatchable, verifiable, traceable multi-agent network. 把多台 Agent CLI 编排成可调度、可验收、可追溯的协作网络。
+
+## Core
+
+- Task-card JSON → worker dispatch → machine verification → persisted results
+- Serial pipelines (`{{prev_output}}`) and parallel DAGs (`depends_on`, `{{nodes.N.output}}`)
+- Every run emits a flow diagram; ledger.jsonl records all runs with tokens/cost
+
+## Key files
+
+- run_worker.sh — single-task adapter; header comment is the task-card schema (source of truth)
+- run_pipeline.sh — serial multi-node runner
+- run_dag.py — DAG parallel runner with topological layers
+- mesh_board.py — ops board (history/tokens/trends)
+- AGENTS.md — guide for AI agents entering this repo
+- docs/WORKERS.md — how to add a new worker CLI
+- docs/ARCHITECTURE.md — design decisions
+
+## Workers
+
+dsh (DeepSeek Harness) · codex (OpenAI) · opencode · hermes · arkcli (Volcano Ark/Doubao) · claude (credential-gated on ANTHROPIC_API_KEY)
+
+## Quick start
+
+./scripts/setup.sh && ./run_worker.sh examples/tasks/002-ping-dsh.json
+
+## License
+
+CC BY-NC-SA 4.0 (non-commercial)
