@@ -47,23 +47,45 @@ Every worker call is a **fresh context** — the core value of multi-harness orc
 
 Adding a worker is a single `case` branch in `run_worker.sh` — see [docs/WORKERS.md](docs/WORKERS.md).
 
-## For AI Agents (three-step onboarding)
+## Installation SOP: give your Agents agent-mesh
 
-The caller of agent-mesh *is* an agent — all onboarding channels are built in:
+The caller of agent-mesh *is* an agent. Four steps and every agent on your machine can drive it:
 
-1. **AGENTS.md** (repo root) — auto-read by Codex / Claude Code / Cursor; contains the shortest path and the rules
-2. **Installable Skill** — `./scripts/install-skill.sh` symlinks `skills/agent-mesh/` into every detected agent skill directory (Claude/CatPaw/OpenCode/Cursor/CodeBuddy/Qwen/Hermes…); then trigger in natural language: "dispatch X to dsh", "run a pipeline: A drafts, B reviews"
-3. **llms.txt** — a compact project digest for LLMs
+**Step 0 · Environment check**
 
 ```bash
-./scripts/install-skill.sh --list   # preview targets
-./scripts/install-skill.sh          # install everywhere
+git clone https://github.com/anthonyhann/agent-mesh.git && cd agent-mesh
+./scripts/setup.sh    # checks python3/zstd/timeout/worker CLIs/optional capabilities
 ```
+
+**Step 1 · Install the skill into all agents** (once, machine-wide)
+
+```bash
+./scripts/install-skill.sh --list   # preview target skill directories
+./scripts/install-skill.sh          # symlink install (repo updates propagate everywhere)
+```
+
+**Step 2 · Restart your agent session and trigger in natural language**
+
+Say to any agent (Claude Code / CatPaw / OpenCode / Cursor / Qwen…):
+
+- "Dispatch task X to dsh"
+- "Run a pipeline: A drafts, B reviews"
+- "Analyze these three docs with a parallel DAG"
+- "Show the ops board"
+
+**Step 3 · Verify the chain**
+
+```bash
+./run_worker.sh examples/tasks/002-ping-dsh.json   # or just ask your agent: "run a ping via agent-mesh"
+```
+
+**Troubleshooting**: skill not discovered → restart the session; `ls -la ~/.claude/skills/agent-mesh` (or your agent's dir) should be a symlink into the repo. Agents working *inside* the repo need no install — `AGENTS.md` at root is auto-read (Codex/Claude Code/Cursor), and `llms.txt` provides an LLM digest.
 
 ## Quick start
 
 ```bash
-git clone <repo> && cd agent-mesh
+git clone https://github.com/anthonyhann/agent-mesh.git && cd agent-mesh
 ./scripts/setup.sh          # environment check (deps / CLIs / optional capabilities)
 
 ./run_worker.sh examples/tasks/002-ping-dsh.json                 # single dispatch

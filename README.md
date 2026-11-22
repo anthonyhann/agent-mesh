@@ -47,23 +47,45 @@ python3 mesh_board.py            # 运行看板：历史/成功率/tokens 一页
 
 新 worker 接入只需在 `run_worker.sh` 加一个 case 分支，见 [docs/WORKERS.md](docs/WORKERS.md)。
 
-## 给 AI Agent 用（三步接入）
+## 安装 SOP：让你的 Agent 用上 agent-mesh
 
-agent-mesh 的调用方就是 Agent，接入通道全铺好：
+agent-mesh 的调用方就是 Agent。照做四步，你机器上所有 Agent 都能调度它：
 
-1. **AGENTS.md**（根目录）——Codex / Claude Code / Cursor 等进入仓库自动读取，含最短上手路径与纪律
-2. **可安装 Skill**——`./scripts/install-skill.sh` 把 `skills/agent-mesh/` 以 symlink 装进本机所有 Agent 的技能目录（Claude/CatPaw/OpenCode/Cursor/CodeBuddy/Qwen/Hermes…），装完即可用自然语言触发：「派单给 dsh 做 X」「跑个管线 A 起草 B 复核」
-3. **llms.txt**——LLM 专用的项目速读文件
+**Step 0 · 环境自检**
 
 ```bash
-./scripts/install-skill.sh --list   # 先看会装到哪
-./scripts/install-skill.sh          # 一键安装
+git clone https://github.com/anthonyhann/agent-mesh.git && cd agent-mesh
+./scripts/setup.sh    # 检查 python3/zstd/timeout/各 worker CLI/可选能力
 ```
+
+**Step 1 · 安装 Skill 到各 Agent**（一次安装，全机 agent 生效）
+
+```bash
+./scripts/install-skill.sh --list   # 预览：会装进哪些 agent 的技能目录
+./scripts/install-skill.sh          # 执行：symlink 安装（仓库更新即全机同步）
+```
+
+**Step 2 · 重开 Agent 会话，自然语言触发**
+
+对你的任意 Agent（Claude Code / CatPaw / OpenCode / Cursor / Qwen…）说：
+
+- 「派单给 dsh 做 X」
+- 「跑个管线：A 起草，B 复核」
+- 「用 DAG 并行分析这三份材料」
+- 「看下运行看板」
+
+**Step 3 · 验证链路**
+
+```bash
+./run_worker.sh examples/tasks/002-ping-dsh.json   # 或直接让 Agent 跑：「用 agent-mesh 跑个 ping」
+```
+
+**排错**：Skill 未被发现 → 确认重开了会话；`ls -la ~/.claude/skills/agent-mesh`（或对应 agent 目录）应是指向仓库的 symlink；依旧不行则检查该 agent 是否支持你系统的 skills 目录约定。Agent 进入仓库目录工作时无需安装——根目录 `AGENTS.md` 会被自动读取（Codex/Claude Code/Cursor 均支持），`llms.txt` 提供 LLM 速读。
 
 ## 快速开始
 
 ```bash
-git clone <repo> && cd agent-mesh
+git clone https://github.com/anthonyhann/agent-mesh.git && cd agent-mesh
 ./scripts/setup.sh          # 环境自检（依赖/CLI/可选能力）
 
 # 1. 单任务派单（examples/tasks/ 有六家 ping 样例）
