@@ -44,6 +44,7 @@ Every worker call is a **fresh context** — the core value of multi-harness orc
 | Hermes | `hermes -z` | `--resume` | session store export | lightweight |
 | ArkCLI (Volcano Ark / Doubao) | `arkcli +chat` | `--previous-response-id` | envelope usage | json_schema structured output |
 | Claude Code | `claude -p` | `--resume` | envelope usage + **cost_usd** | credential-gated: set `ANTHROPIC_API_KEY` to activate |
+| Qwen Code | `qwen "prompt" --approval-mode yolo` | `--resume <id>` | `~/.qwen/usage_record.jsonl` | gemini fork, Alibaba Qwen |
 
 Adding a worker is a single `case` branch in `run_worker.sh` — see [docs/WORKERS.md](docs/WORKERS.md).
 

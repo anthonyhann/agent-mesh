@@ -6,7 +6,7 @@ MESH="${MESH_ROOT:-$(cd "$(dirname "${0:A}")" && pwd)}"
 cd "$MESH"
 
 PASS=0; FAIL=0
-for w in codex opencode hermes dsh arkcli claude; do
+for w in codex opencode hermes dsh arkcli claude qwen; do
   TOKEN="KUMQUAT-${w}-42"
   if [[ "$w" == "claude" && -z "${ANTHROPIC_API_KEY:-}" && ! -f "$MESH/claude.env" ]]; then
     print -r -- "  ⏭️  claude 未配置 ANTHROPIC_API_KEY（预期内跳过）"; continue

@@ -19,6 +19,7 @@ WORKER_STYLE = {
     "hermes":   ("#f59e0b", "Hermes"),
     "arkcli":   ("#ff6a00", "Ark·豆包"),
     "claude":   ("#d97706", "Claude"),
+    "qwen":     ("#615ced", "Qwen"),
     "catdesk":  ("#6e6e73", "CatDesk"),
 }
 STATUS_STYLE = {

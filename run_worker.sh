@@ -26,6 +26,9 @@
 
 set -uo pipefail
 
+# 常见 CLI 安装位置增补（幂等）：pnpm 全局 bin（qwen-code 等）
+[[ -d "$HOME/Library/pnpm" ]] && export PATH="$HOME/Library/pnpm:$PATH"
+
 MESH_ROOT="${MESH_ROOT:-$(cd "$(dirname "${0:A}")" && pwd)}"
 DEFAULT_TIMEOUT=300
 
@@ -133,7 +136,13 @@ case "$T_WORKER" in
       [[ -n "$T_SESSION" ]] && CMD+=(--resume "$T_SESSION")
     fi
     ;;
-  *) die "unknown worker: $T_WORKER (supported: dsh codex opencode hermes arkcli claude)" ;;
+  qwen)
+    # Qwen Code（gemini fork）：位置参数 prompt + yolo 无人值守；usage 走 ~/.qwen/usage_record.jsonl
+    # 续接用 --resume <id>；--session-id 是"给新 session 命名"（adopt 语义），传已存在 id 会报错
+    CMD=(qwen "$T_BRIEF" --approval-mode yolo)
+    [[ -n "$T_SESSION" ]] && CMD+=(--resume "$T_SESSION")
+    ;;
+  *) die "unknown worker: $T_WORKER (supported: dsh codex opencode hermes arkcli claude qwen)" ;;
 esac
 
 # ---------- 执行 ----------
@@ -272,6 +281,29 @@ if not session_id:
                                 cands.append((mt, sid))
             if cands:
                 session_id = max(cands)[1]
+        elif w == "qwen":
+            # ~/.qwen/usage_record.jsonl 按时间窗取本 run 的记录：sessionId + tokens 同源
+            import datetime as _dt
+            start_ms = int(_dt.datetime.fromisoformat(os.environ["START_ISO"].replace("Z", "+00:00")).timestamp() * 1000) - 10000
+            ur = os.path.expanduser("~/.qwen/usage_record.jsonl")
+            if os.path.exists(ur):
+                best = None
+                with open(ur, errors="replace") as _f:
+                    for _line in _f:
+                        try:
+                            _r = json.loads(_line)
+                        except Exception:
+                            continue
+                        if _r.get("timestamp", 0) >= start_ms:
+                            best = _r
+                if best:
+                    session_id = best.get("sessionId")
+                    _tin = _tout = 0
+                    for _m, _v in (best.get("models") or {}).items():
+                        _tin += _v.get("inputTokens") or 0
+                        _tout += _v.get("outputTokens") or 0
+                    if _tin or _tout:
+                        tokens = _tin + _tout
     except Exception:
         pass
 

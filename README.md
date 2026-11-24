@@ -44,6 +44,7 @@ python3 mesh_board.py            # 运行看板：历史/成功率/tokens 一页
 | Hermes | `hermes -z` | `--resume` | 会话库导出 | 轻量快速 |
 | ArkCLI（火山方舟/豆包） | `arkcli +chat` | `--previous-response-id` | 响应信封 usage | json_schema 强结构化输出 |
 | Claude Code | `claude -p` | `--resume` | 信封 usage + **cost_usd** | 凭据门控：配 `ANTHROPIC_API_KEY` 即激活 |
+| Qwen Code | `qwen "prompt" --approval-mode yolo` | `--resume <id>` | `~/.qwen/usage_record.jsonl` | gemini fork，阿里千问 |
 
 新 worker 接入只需在 `run_worker.sh` 加一个 case 分支，见 [docs/WORKERS.md](docs/WORKERS.md)。
 

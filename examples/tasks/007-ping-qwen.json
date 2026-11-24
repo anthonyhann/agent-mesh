@@ -1,0 +1,3 @@
+{"id":"007-ping-qwen","worker":"qwen","timeout_seconds":120,
+ "brief":"Reply with exactly one word: PONG. No punctuation, no explanation.",
+ "done_criteria":{"stdout_regex":"PONG"}}
