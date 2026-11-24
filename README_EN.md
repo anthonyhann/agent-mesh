@@ -5,6 +5,7 @@
 **中文** → [README.md](README.md)
 
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](LICENSE)
+[![npm version](https://img.shields.io/npm/v/agent-mesh-tui.svg)](https://www.npmjs.com/package/agent-mesh-tui)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue)
 ![Shell](https://img.shields.io/badge/zsh%20%2B%20python3-only-green)
 
