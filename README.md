@@ -90,6 +90,23 @@ git clone https://github.com/anthonyhann/agent-mesh.git && cd agent-mesh
 
 **排错**：Skill 未被发现 → 确认重开了会话；`ls -la ~/.claude/skills/agent-mesh`（或对应 agent 目录）应是指向仓库的 symlink；依旧不行则检查该 agent 是否支持你系统的 skills 目录约定。Agent 进入仓库目录工作时无需安装——根目录 `AGENTS.md` 会被自动读取（Codex/Claude Code/Cursor 均支持），`llms.txt` 提供 LLM 速读。
 
+## TUI：终端交互界面（推荐入口）
+
+```bash
+python3 mesh_tui.py    # 或 ./mesh_tui.py
+```
+
+零依赖（python3 标准库 curses），↑↓ 选择 · Enter 确认 · q 返回/退出：
+
+| 面板 | 能力 |
+|---|---|
+| 环境自检 | python3/zstd/timeout + 八 worker CLI 检测 + 可选能力（workbuddy/claude 凭据） |
+| 安装 Skill 到 Agent | 预览并一键 symlink 安装到全部检测到的 Agent 技能目录 |
+| 快捷派单 | 选 worker → 输入 brief → 立即执行 → 状态/耗时/tokens/子会话链接一屏展示 |
+| 运行状态 | 最近 12 次运行、成功率、tokens 累计 |
+| 运行示例 | 一键体验 pipeline / DAG 样例 |
+| 运维工具 | smoke 自检 / prune 清理 |
+
 ## 快速开始
 
 ```bash

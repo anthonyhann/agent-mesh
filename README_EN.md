@@ -90,6 +90,23 @@ Say to any agent (Claude Code / CatPaw / OpenCode / Cursor / Qwen…):
 
 **Troubleshooting**: skill not discovered → restart the session; `ls -la ~/.claude/skills/agent-mesh` (or your agent's dir) should be a symlink into the repo. Agents working *inside* the repo need no install — `AGENTS.md` at root is auto-read (Codex/Claude Code/Cursor), and `llms.txt` provides an LLM digest.
 
+## TUI: terminal UI (recommended entry)
+
+```bash
+python3 mesh_tui.py    # or ./mesh_tui.py
+```
+
+Zero dependencies (python3 stdlib curses). ↑↓ select · Enter confirm · q back/quit:
+
+| Panel | Capability |
+|---|---|
+| Env check | python3/zstd/timeout + 8 worker CLIs + optional capabilities (workbuddy/claude key) |
+| Install skill | preview and one-key symlink install into every detected agent skill directory |
+| Quick dispatch | pick worker → type brief → run → status/duration/tokens/sub-session link on one screen |
+| Run status | latest 12 runs, success rate, cumulative tokens |
+| Examples | one-key pipeline / DAG sample runs |
+| Ops | smoke self-check / prune cleanup |
+
 ## Quick start
 
 ```bash
