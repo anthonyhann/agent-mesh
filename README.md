@@ -59,7 +59,17 @@ python3 mesh_board.py            # 运行看板：历史/成功率/tokens 一页
 
 agent-mesh 的调用方就是 Agent。照做四步，你机器上所有 Agent 都能调度它：
 
-**Step 0 · 环境自检**
+**Step 0 · 安装**
+
+方式一 · **npm（推荐）**：
+
+```bash
+npm i -g agent-mesh-tui     # 一条命令安装；agent-mesh / mesh-tui 命令立即可用
+agent-mesh                  # 启动 TUI
+npm i -g agent-mesh-tui@latest   # 升级
+```
+
+方式二 · git clone（开发者/改代码）：
 
 ```bash
 git clone https://github.com/anthonyhann/agent-mesh.git && cd agent-mesh
@@ -93,7 +103,8 @@ git clone https://github.com/anthonyhann/agent-mesh.git && cd agent-mesh
 ## TUI：终端交互界面（推荐入口）
 
 ```bash
-python3 mesh_tui.py    # 或 ./mesh_tui.py
+agent-mesh    # npm 安装后
+# 或在仓库目录：python3 mesh_tui.py
 ```
 
 零依赖（python3 标准库 curses），↑↓ 选择 · Enter 确认 · q 返回/退出：

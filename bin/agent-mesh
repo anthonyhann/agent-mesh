@@ -1,0 +1,37 @@
+#!/bin/sh
+# agent-mesh launcher — 定位 npm 包根（跟随 symlink）→ 找 python3 → 启动 TUI
+# 通过 npm i -g agent-mesh-tui 安装后可直接运行: agent-mesh / mesh-tui
+# 也支持: agent-mesh --version | --update-check
+
+set -u
+SELF="$0"
+while [ -h "$SELF" ]; do
+  DIR=$(cd "$(dirname "$SELF")" && pwd)
+  LINK=$(readlink "$SELF")
+  case "$LINK" in
+    /*) SELF="$LINK" ;;
+    *)  SELF="$DIR/$LINK" ;;
+  esac
+done
+ROOT=$(cd "$(dirname "$SELF")/.." && pwd)
+
+case "${1:-}" in
+  --version|-v)
+    sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$ROOT/package.json" | head -1
+    exit 0
+    ;;
+  --update-check)
+    CURR=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$ROOT/package.json" | head -1)
+    LATEST=$(npm view agent-mesh-tui version --registry https://registry.npmjs.org 2>/dev/null || echo unknown)
+    echo "current: $CURR | latest: $LATEST"
+    [ "$CURR" = "$LATEST" ] && echo "已是最新" || echo "升级: npm i -g agent-mesh-tui@latest"
+    exit 0
+    ;;
+esac
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "agent-mesh 需要 python3（>=3.8）。安装后重试：brew install python3" >&2
+  exit 1
+fi
+
+exec python3 "$ROOT/mesh_tui.py" "$@"

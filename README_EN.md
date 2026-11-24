@@ -59,7 +59,17 @@ Each dispatch renders `results/<id>/session.html`: worker badge, status/duration
 
 The caller of agent-mesh *is* an agent. Four steps and every agent on your machine can drive it:
 
-**Step 0 · Environment check**
+**Step 0 · Install**
+
+Option A · **npm (recommended)**:
+
+```bash
+npm i -g agent-mesh-tui     # one-line install; agent-mesh / mesh-tui commands ready
+agent-mesh                  # launch TUI
+npm i -g agent-mesh-tui@latest   # upgrade
+```
+
+Option B · git clone (developers):
 
 ```bash
 git clone https://github.com/anthonyhann/agent-mesh.git && cd agent-mesh
@@ -93,7 +103,8 @@ Say to any agent (Claude Code / CatPaw / OpenCode / Cursor / Qwen…):
 ## TUI: terminal UI (recommended entry)
 
 ```bash
-python3 mesh_tui.py    # or ./mesh_tui.py
+agent-mesh    # after npm install
+# or inside the repo: python3 mesh_tui.py
 ```
 
 Zero dependencies (python3 stdlib curses). ↑↓ select · Enter confirm · q back/quit:
