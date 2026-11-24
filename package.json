@@ -1,6 +1,6 @@
 {
   "name": "agent-mesh-tui",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Terminal UI and orchestration layer for multiple Agent CLIs (dsh/codex/opencode/hermes/arkcli/claude/qwen/pi) — dispatchable, verifiable, traceable multi-agent network",
   "bin": {
     "agent-mesh": "bin/agent-mesh",
@@ -15,9 +15,23 @@
   },
   "homepage": "https://github.com/anthonyhann/agent-mesh",
   "keywords": [
-    "multi-agent", "llm", "agent-cli", "orchestration", "ai-workflow",
-    "agent-mesh", "tui", "cli", "deepseek", "codex", "opencode", "claude", "qwen"
+    "multi-agent",
+    "llm",
+    "agent-cli",
+    "orchestration",
+    "ai-workflow",
+    "agent-mesh",
+    "tui",
+    "cli",
+    "deepseek",
+    "codex",
+    "opencode",
+    "claude",
+    "qwen"
   ],
   "license": "CC-BY-NC-SA-4.0",
-  "os": ["darwin", "linux"]
+  "os": [
+    "darwin",
+    "linux"
+  ]
 }
