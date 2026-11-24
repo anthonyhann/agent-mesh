@@ -45,8 +45,15 @@ Every worker call is a **fresh context** — the core value of multi-harness orc
 | ArkCLI (Volcano Ark / Doubao) | `arkcli +chat` | `--previous-response-id` | envelope usage | json_schema structured output |
 | Claude Code | `claude -p` | `--resume` | envelope usage + **cost_usd** | credential-gated: set `ANTHROPIC_API_KEY` to activate |
 | Qwen Code | `qwen "prompt" --approval-mode yolo` | `--resume <id>` | `~/.qwen/usage_record.jsonl` | gemini fork, Alibaba Qwen |
+| Pi (pi-mono) | `pi -p --mode json` | `--session <id>` | event-stream usage | richest event stream (thinking/tool calls), best sub-session experience |
 
 Adding a worker is a single `case` branch in `run_worker.sh` — see [docs/WORKERS.md](docs/WORKERS.md).
+
+## Sub-sessions: every run is clickable
+
+Each dispatch renders `results/<id>/session.html`: worker badge, status/duration/tokens/cost cards, the brief, an **event-stream timeline** (thinking + tool calls for json-capable workers like pi), and a "continue in this context" card with a copyable `session_id` for the next task card.
+
+**Environment isolation**: workers run under an env whitelist sandbox — host agent's approval/sandbox variables are stripped, so sub-tasks run entirely under **each worker's own auth and permission model**.
 
 ## Installation SOP: give your Agents agent-mesh
 

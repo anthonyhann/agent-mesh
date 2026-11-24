@@ -45,8 +45,15 @@ python3 mesh_board.py            # 运行看板：历史/成功率/tokens 一页
 | ArkCLI（火山方舟/豆包） | `arkcli +chat` | `--previous-response-id` | 响应信封 usage | json_schema 强结构化输出 |
 | Claude Code | `claude -p` | `--resume` | 信封 usage + **cost_usd** | 凭据门控：配 `ANTHROPIC_API_KEY` 即激活 |
 | Qwen Code | `qwen "prompt" --approval-mode yolo` | `--resume <id>` | `~/.qwen/usage_record.jsonl` | gemini fork，阿里千问 |
+| Pi（pi-mono） | `pi -p --mode json` | `--session <id>` | 事件流 usage | 事件流最全（思考/工具调用全记录），子会话体验最佳 |
 
 新 worker 接入只需在 `run_worker.sh` 加一个 case 分支，见 [docs/WORKERS.md](docs/WORKERS.md)。
+
+## 子会话：每次运行可点开
+
+每次派单自动生成 `results/<id>/session.html`：worker 徽章、状态/耗时/tokens/成本指标卡、brief、**事件流时间线**（pi 等支持 json 事件流的 worker 含思考与工具调用块）、以及「在同一上下文继续」卡（含可复制的 session_id，下轮任务单带上即续接）。
+
+**环境隔离**：worker 在 env 白名单净化下运行——剔除宿主 agent 注入的审批/沙箱变量，子任务完全使用 **worker 自身的认证与权限模型**。
 
 ## 安装 SOP：让你的 Agent 用上 agent-mesh
 

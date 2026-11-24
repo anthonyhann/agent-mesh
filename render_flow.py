@@ -20,6 +20,7 @@ WORKER_STYLE = {
     "arkcli":   ("#ff6a00", "Ark·豆包"),
     "claude":   ("#d97706", "Claude"),
     "qwen":     ("#615ced", "Qwen"),
+    "pi":       ("#e11d48", "Pi"),
     "catdesk":  ("#6e6e73", "CatDesk"),
 }
 STATUS_STYLE = {

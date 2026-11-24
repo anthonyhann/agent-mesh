@@ -73,7 +73,7 @@ fi
 
 # ---------- 3. 工人真 ping（有模型调用；claude 未配 key 时预期跳过） ----------
 section "工人 ping"
-for w in dsh arkcli codex opencode hermes claude qwen; do
+for w in dsh arkcli codex opencode hermes claude qwen pi; do
   if [[ "$w" == "claude" && -z "${ANTHROPIC_API_KEY:-}" && ! -f "$MESH/claude.env" ]]; then
     print -r -- "  ⏭️  claude 未配置 ANTHROPIC_API_KEY（预期内跳过）"; continue
   fi

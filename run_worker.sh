@@ -57,6 +57,7 @@ emit("T_SESSION",  d.get("session_id"))
 emit("T_PERM",     d.get("permission_mode"))
 emit("T_MAXTOK",   d.get("max_output_tokens"))
 emit("T_PROFILE",  d.get("profile"))
+emit("T_PROVIDER", d.get("provider"))
 emit("T_SCHEMA",   d.get("text_schema"))
 emit("T_THINKING", d.get("thinking"))
 retry = d.get("retry") or {}
@@ -142,7 +143,15 @@ case "$T_WORKER" in
     CMD=(qwen "$T_BRIEF" --approval-mode yolo)
     [[ -n "$T_SESSION" ]] && CMD+=(--resume "$T_SESSION")
     ;;
-  *) die "unknown worker: $T_WORKER (supported: dsh codex opencode hermes arkcli claude qwen)" ;;
+  pi)
+    # pi（Mario Zechner pi-mono）：-p 非交互 + --mode json NDJSON 事件流（思考/工具调用全记录）
+    # 模型经本地 dsh openai-gateway（127.0.0.1:8326），--provider/--model 可覆盖
+    CMD=(pi -p "$T_BRIEF" --mode json)
+    CMD+=(--provider "${T_PROVIDER:-dsh-gateway}")
+    CMD+=(--model "${T_MODEL:-deepseek-official/deepseek-flash}")
+    [[ -n "$T_SESSION" ]] && CMD+=(--session "$T_SESSION")
+    ;;
+  *) die "unknown worker: $T_WORKER (supported: dsh codex opencode hermes arkcli claude qwen pi)" ;;
 esac
 
 # ---------- 执行 ----------
@@ -161,9 +170,21 @@ if [[ -n "${SKIP_EXEC:-}" ]]; then
   print -r -- "$SKIP_EXEC" > "$STDERR_F"
   EXIT_CODE=1
 else
+  # ---------- 环境净化：子任务运行在 worker 自身的认证与权限模型 ----------
+  # 白名单保留系统必需与各 worker 凭证；剔除宿主 agent 注入（CATPAW_* 等审批/沙箱变量）
+  typeset -a ENVARGS
+  eval "ENVARGS=($(python3 - <<'PYCLEAN'
+import os, shlex
+EXACT = {"PATH","HOME","LANG","LC_ALL","TMPDIR","TERM","USER","LOGNAME","SHELL","EDITOR","SSH_AUTH_SOCK","TZ",
+         "https_proxy","http_proxy","no_proxy","all_proxy","HTTPS_PROXY","HTTP_PROXY","NO_PROXY","ALL_PROXY"}
+PREFIX = ("ANTHROPIC_","MAGPIE_","WORKBUDDY_","OPENAI_","DEEPSEEK_","ARK_","QWEN_","PI_","XDG_","VOLC_","GEMINI_","GOOGLE_","HF_")
+keep = {k: v for k, v in os.environ.items() if k in EXACT or k.startswith(PREFIX)}
+print(" ".join(f"{k}={shlex.quote(v)}" for k, v in keep.items()))
+PYCLEAN
+))"
   while true; do
     # stdin 统一封 /dev/null：任务全部由 brief 提供，防止 worker（如 codex）检测非 TTY 时误读 stdin
-    timeout "$TIMEOUT_SECS" "${CMD[@]}" < /dev/null >"$STDOUT_F" 2>"$STDERR_F"
+    env -i "${ENVARGS[@]}" timeout "$TIMEOUT_SECS" "${CMD[@]}" < /dev/null >"$STDOUT_F" 2>"$STDERR_F"
     EXIT_CODE=$?
     if [[ $EXIT_CODE -eq 0 || $ATTEMPT -ge $MAX_ATTEMPTS ]]; then
       break
@@ -182,7 +203,7 @@ DURATION=$((END_TS - START_TS))
 # ---------- 验收 + 写 result.json ----------
 # content-aware：stdout 若为含 content 字段的 JSON 信封（如 arkcli），
 # criteria 只对 content 匹配，防止 thinking 模型的 reasoning_content 造成假阳性。
-STATUS=$(TASK_FILE="$TASK_FILE" OUT_DIR="$OUT_DIR" T_ID="$T_ID" T_WORKER="$T_WORKER" \
+STATUS=$(TASK_FILE="$TASK_FILE" OUT_DIR="$OUT_DIR" T_ID="$T_ID" T_WORKER="$T_WORKER" T_BRIEF="$T_BRIEF" \
 EXIT_CODE="$EXIT_CODE" DURATION="$DURATION" ATTEMPTS="$ATTEMPTS" \
 START_ISO="$START_ISO" END_ISO="$END_ISO" T_REGEX="$T_REGEX" \
 python3 - <<'PYEOF'
@@ -304,6 +325,42 @@ if not session_id:
                         _tout += _v.get("outputTokens") or 0
                     if _tin or _tout:
                         tokens = _tin + _tout
+        elif w == "pi":
+            # pi NDJSON 事件流：首事件 type=session 含 id；末条 assistant message_end 的 usage.totalTokens
+            _sid = None
+            _tok = None
+            for _line in stdout_txt.strip().split("\n"):
+                try:
+                    _e = json.loads(_line)
+                except Exception:
+                    continue
+                _t = _e.get("type")
+                if _t == "session" and _e.get("id"):
+                    _sid = _e["id"]
+                elif _t == "message_end":
+                    _m = _e.get("message") or {}
+                    if _m.get("role") == "assistant":
+                        _u = _m.get("usage") or {}
+                        if _u.get("totalTokens"):
+                            _tok = _u["totalTokens"]
+            session_id = session_id or _sid
+            tokens = tokens if tokens is not None else _tok
+            # pi answer 归一：NDJSON 最后一条 assistant text 作为正文（覆盖 target）
+            _texts = []
+            for _line in stdout_txt.strip().split("\n"):
+                try:
+                    _e = json.loads(_line)
+                except Exception:
+                    continue
+                if _e.get("type") == "message_end":
+                    _m = _e.get("message") or {}
+                    if _m.get("role") == "assistant":
+                        for _b in (_m.get("content") or []):
+                            if _b.get("type") == "text" and _b.get("text"):
+                                _texts.append(_b["text"])
+            if _texts:
+                target = _texts[-1]
+                target_kind = "content"
     except Exception:
         pass
 
@@ -394,6 +451,7 @@ result = {
     "stdout_path": os.path.join(out, "stdout.txt"),
     "stderr_path": os.path.join(out, "stderr.txt"),
     "answer_preview": target.strip()[:500],
+    "brief_preview": os.environ.get("T_BRIEF", "")[:300],
     "criteria": criteria,
     "session_id": session_id,
     "tokens": tokens,
@@ -441,5 +499,9 @@ except Exception:
 with open(os.environ["LEDGER"], "a") as f:
     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 PYEOF
+
+# ---------- 子会话页面（可点开：思考/工具调用/token/耗时） ----------
+python3 "$MESH_ROOT/render_session.py" "$OUT_DIR" >/dev/null 2>&1 || true
+[[ -f "$OUT_DIR/session.html" ]] && print -r -- "子会话: file://$OUT_DIR/session.html"
 
 [[ "$STATUS" == "success" ]] && exit 0 || exit 1

@@ -19,7 +19,7 @@
 
 ## 纪律（违反会产出坏结果）
 
-- **按任务类型规则路由 worker**，不要用你的判断现场"选模型"：重型/浏览器→dsh，编码/review→codex，多模型→opencode，轻量→hermes，豆包系/结构化输出→arkcli，阿里千问/大上下文窗口→qwen，claude 需 API key
+- **按任务类型规则路由 worker**，不要用你的判断现场"选模型"：重型/浏览器→dsh，编码/review→codex，多模型→opencode，轻量→hermes，豆包系/结构化输出→arkcli，阿里千问/大上下文窗口→qwen，编码工具链/过程可观测→pi，claude 需 API key
 - **done_criteria 必须机器可判**（stdout_regex），禁止"看起来对"
 - brief 里**只传必要信息**；节点间上下文经 `answer.txt` 归一化，超长自动转文件引用
 - 看到 `criteria_failed` 说明答案不对不是执行错——重试无意义，改 brief
