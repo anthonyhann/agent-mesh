@@ -18,7 +18,7 @@ import unicodedata
 from pathlib import Path
 
 ROOT = Path(os.environ.get("MESH_ROOT", Path(__file__).resolve().parent))
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 WORKERS = ["dsh", "codex", "opencode", "hermes", "arkcli", "claude", "qwen", "pi"]
 AGENT_DIRS = [
     ("中央库", "~/.agents/skills"), ("Claude", "~/.claude/skills"),
@@ -116,6 +116,7 @@ class TUI:
 
     def chrome(self, title):
         """框架：LOGO 区（高度足够时）+ 顶栏 + 分隔线 + 底栏。返回内容区起始行。"""
+        self.s.clear()          # 全屏重绘：防止上一页内容残留叠加
         h, w = self.s.getmaxyx()
         top = 0
         # LOGO：窗口高度 ≥22 且宽度 ≥52 时展示（独立区域，不与任何内容重叠）
@@ -137,6 +138,21 @@ class TUI:
         self.put(h - 1, max(0, w - dwidth(hint)), hint, curses.A_DIM)
         return top
 
+    def snapshot(self):
+        """MESH_TUI_DUMP 调试/CI：每次渲染后覆盖写当前真实画面（最后一帧即退出前画面）。"""
+        path = os.environ.get("MESH_TUI_DUMP")
+        if not path:
+            return
+        hh, ww = self.s.getmaxyx()
+        dump = [f"[size {hh}x{ww}]"]
+        for r in range(hh):
+            try:
+                row = self.s.instr(r, 0)
+                dump.append(row.decode("utf-8", errors="replace").rstrip())
+            except curses.error:
+                dump.append("")
+        Path(path).write_text("\n".join(dump))
+
     def main_loop(self):
         while True:
             if self.too_small():
@@ -154,19 +170,7 @@ class TUI:
                 y += 1
             self.put(y + 1, 2, "选择后回车执行。首次使用建议先跑 ① 环境自检。", curses.A_DIM)
             self.s.refresh()
-            if os.environ.get("MESH_TUI_DUMP"):
-                # 调试/CI：把真实渲染画面 dump 为纯文本后退出
-                hh, ww = self.s.getmaxyx()
-                dump = []
-                for r in range(hh):
-                    try:
-                        row = self.s.instr(r, 0)
-                        dump.append(row.decode("utf-8", errors="replace").rstrip())
-                    except curses.error:
-                        dump.append("")
-                dump.insert(0, f"[size {hh}x{ww}]")
-                Path(os.environ["MESH_TUI_DUMP"]).write_text("\n".join(dump))
-                return
+            self.snapshot()
             k = self.s.getch()
             if k == curses.KEY_UP:
                 self.sel = (self.sel - 1) % len(MENU)
@@ -199,6 +203,7 @@ class TUI:
                     self.put(top + i, 2, lines[idx][: w - 4])
             self.put(h - 1, 1, pad(f" {footer}", w - 2), curses.A_REVERSE)
             self.s.refresh()
+            self.snapshot()
             k = self.s.getch()
             if k == curses.KEY_UP:
                 off = max(0, off - 1)
@@ -219,6 +224,7 @@ class TUI:
         for i, line in enumerate(lines):
             self.put(top + i, 2, line)
         self.s.refresh()
+        self.snapshot()
 
     # ---------- 1 环境自检 ----------
     def page_setup(self):
