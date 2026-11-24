@@ -18,7 +18,7 @@ import unicodedata
 from pathlib import Path
 
 ROOT = Path(os.environ.get("MESH_ROOT", Path(__file__).resolve().parent))
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 WORKERS = ["dsh", "codex", "opencode", "hermes", "arkcli", "claude", "qwen", "pi"]
 AGENT_DIRS = [
     ("中央库", "~/.agents/skills"), ("Claude", "~/.claude/skills"),
@@ -27,6 +27,15 @@ AGENT_DIRS = [
     ("Qwen", "~/.qwen/skills"), ("Junie", "~/.junie/skills"),
     ("Hermes", "~/.hermes/skills"), ("WorkBuddy", "~/.workbuddy-ai/skills"),
 ]
+LOGO = [
+    "   _                            _           ",
+    "  __ _  __ _  ___ _| |_ _____ _ __ ___   ___ __| |__",
+    " / _` |/ _` |/ _ \\ '_ \\___/ '_ ` _ \\ / _ / __| '_ \\",
+    "| (_| | (_| |  __| | | |  | | | | | |  __\\__ | | | |",
+    " \\__,_|\\__, |\\___|_| |_|  |_| |_| |_|\\___|___|_| |_|",
+    "      |___/                                           ",
+]
+
 MENU = [
     ("1", "环境自检", "python3 / zstd / timeout / worker CLI 检测"),
     ("2", "安装 Skill", "把 agent-mesh skill 装进各 Agent 技能目录"),
@@ -106,20 +115,27 @@ class TUI:
         return True
 
     def chrome(self, title):
-        """三段式框架：顶栏(0) + 分隔线(1) + 底栏(h-2,h-1)。返回内容区起始行。"""
+        """框架：LOGO 区（高度足够时）+ 顶栏 + 分隔线 + 底栏。返回内容区起始行。"""
         h, w = self.s.getmaxyx()
+        top = 0
+        # LOGO：窗口高度 ≥22 且宽度 ≥52 时展示（独立区域，不与任何内容重叠）
+        if h >= 22 and w >= 52:
+            for i, line in enumerate(LOGO):
+                self.put(i, 2, line, self.cp(1) | curses.A_BOLD)
+            top = len(LOGO)
         bar_attr = curses.A_REVERSE | curses.A_BOLD
         left = f" agent-mesh TUI  v{VERSION}"
         right = f" {title} "
-        self.put(0, 0, pad(left, max(0, w - dwidth(right) - 1)), bar_attr)
-        self.put(0, max(0, w - dwidth(right)), right, bar_attr)
-        self.put(1, 0, "─" * (w - 1), self.cp(1))
+        self.put(top, 0, pad(left, max(0, w - dwidth(right) - 1)), bar_attr)
+        self.put(top, max(0, w - dwidth(right)), right, bar_attr)
+        self.put(top + 1, 0, "─" * (w - 1), self.cp(1))
+        top += 2
         ok = [x for x in WORKERS if shutil.which(x)]
         hint = "↑↓ 选择 · Enter 确认 · q 返回/退出"
         self.put(h - 2, 0, "─" * (w - 1), self.cp(1))
         self.put(h - 1, 0, pad(f" workers {len(ok)}/{len(WORKERS)}: " + (" ".join(ok) or "无"), max(0, w - dwidth(hint) - 1)), curses.A_DIM)
         self.put(h - 1, max(0, w - dwidth(hint)), hint, curses.A_DIM)
-        return 2
+        return top
 
     def main_loop(self):
         while True:
@@ -368,7 +384,10 @@ class TUI:
 
 
 def main():
-    curses.wrapper(lambda s: TUI(s))
+    try:
+        curses.wrapper(lambda s: TUI(s))
+    except KeyboardInterrupt:
+        print("agent-mesh TUI 已退出（Ctrl+C）")
 
 
 if __name__ == "__main__":
