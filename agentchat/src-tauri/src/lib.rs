@@ -250,10 +250,10 @@ fn run_task_impl(task: Value, state: &AppState) -> Result<Value, String> {
             });
         }
     }
-// M0 假 worker 通道：仅 AGENTCHAT_SELFTEST=1|slow 时允许 fake-bin 前置 PATH，
+// M0 假 worker 通道：仅 AGENTCHAT_SELFTEST=1|slow|lane 时允许 fake-bin 前置 PATH，
 // 避免污染真实聊天/正常使用中的 CLI 解析
 let st = std::env::var("AGENTCHAT_SELFTEST").unwrap_or_default();
-if st == "1" || st == "slow" {
+if st == "1" || st == "slow" || st == "lane" {
 let fake = mesh_data().join("fake-bin");
 if fake.is_dir() {
 let p = format!("{}:{}", fake.display(), state.login_path.lock().unwrap());
@@ -345,14 +345,14 @@ fn room_history(room_id: String, state: tauri::State<'_, AppState>) -> Result<Va
 }
 
 #[tauri::command]
-fn send_message(room_id: String, text: String, state: tauri::State<'_, AppState>) -> Result<Value, String> {
+fn send_message(room_id: String, text: String, client_msg_id: Option<String>, state: tauri::State<'_, AppState>) -> Result<Value, String> {
     let db = Db::open(&state.db_path)?;
-    send_message_core(&db, &state, &room_id, &text)
+    send_message_core(&db, &state, &room_id, &text, client_msg_id.as_deref())
 }
 
-/// 发送消息核心（M1：DM 单成员闭环；群聊 default_target 调度随 M3）
-fn send_message_core(db: &Db, state: &AppState, room_id: &str, text: &str) -> Result<Value, String> {
-    // 1) 上下文 + 用户消息落库
+/// 发送消息核心（M2a-2：消息+turn 同事务进房间 lane，DM 单成员闭环；群聊调度随 M3）
+fn send_message_core(db: &Db, state: &AppState, room_id: &str, text: &str, client_msg_id: Option<&str>) -> Result<Value, String> {
+    // 1) 上下文
     let room = db.get_room(room_id)?;
     let members = room["members"].as_array().cloned().unwrap_or_default();
     let pid = members
@@ -363,11 +363,17 @@ fn send_message_core(db: &Db, state: &AppState, room_id: &str, text: &str) -> Re
     let persona = db.get_persona(&pid)?;
     let engine = persona["engine"].as_str().unwrap_or("").to_string();
     let cwd = room["cwd"].as_str().unwrap_or("").to_string();
-let session = db.last_session(room_id, &pid);
-db.add_message(room_id, "user", "user", text, None, None)?;
 
-// 2) 任务卡（§4.1；session 续接；codex 安全模式字段预置，K3 落地后生效）
-let run_id = format!("run-{}", db::uuid8());
+    // 2) 消息+turn 同事务（§6.2.1）。重复 client_msg_id → created=false：同一 turn 绝不双消费（§4.11）
+    let (_msg_id, _cmid, turn_id, created) =
+        db.add_user_message_turn(room_id, text, client_msg_id, &[pid.clone()])?;
+    if !created {
+        return db.room_history(room_id, 200);
+    }
+
+    // 3) 任务卡（§4.1；session 续接；codex 安全模式字段预置，K3 落地后生效）
+    let session = db.last_session(room_id, &pid);
+    let run_id = format!("run-{}", db::uuid8());
     let mut task = json!({
         "id": run_id, "worker": engine, "workspace": cwd,
         "timeout_seconds": 300, "brief": text,
@@ -379,19 +385,78 @@ let run_id = format!("run-{}", db::uuid8());
         task["sandbox"] = Value::from("read-only");
     }
 
-// 3) 执行 + 落库（本地 Connection 跨 run 无妨，其他命令用自己的连接）
-let result = run_task_impl(task.clone(), state)?;
-// M2a-2 lane 落地前 turn_id 为空，气泡经 legacy_run_id 关联 run（§4.3 join 规则）
-db.add_run(&result, room_id, &pid, &task.to_string(), None, 1)?;
+    // 4) 执行 + 完成事务（§4.3：run+气泡+turn 终态单事务；执行失败也落 failed 终态，不悬挂 turn）
+    let result = run_task_impl(task.clone(), state).unwrap_or_else(|e| json!({
+        "task_id": run_id, "status": "failed", "answer_text": "", "error": e,
+    }));
+    let bubble = bubble_text(&result);
+    db.complete_turn(&turn_id, room_id, &pid, &result, &task.to_string(), 1, &bubble)?;
+    db.room_history(room_id, 200)
+}
+
+/// 气泡文本：无正文输出时落状态占位（与 M1 行为一致）
+fn bubble_text(result: &Value) -> String {
     let status = result["status"].as_str().unwrap_or("failed");
-    let answer = result["answer_text"].as_str().unwrap_or("").to_string();
-    let bubble = if answer.is_empty() {
+    let answer = result["answer_text"].as_str().unwrap_or("");
+    if answer.is_empty() {
         format!("[{status}]（无正文输出）")
     } else {
-        answer
-    };
-db.add_message(room_id, &pid, "persona", &bubble, None, Some(&run_id))?;
-db.room_history(room_id, 200)
+        answer.to_string()
+    }
+}
+
+/// 启动崩溃恢复（§6.2.1）：只补未完成的 persona——run 成功缺气泡幂等补写；
+/// run 缺失/interrupted 按 attempt+1 重跑（新 run_id）。返回执行的恢复动作数。
+fn recover_pending_turns(state: &AppState) -> Result<usize, String> {
+    let db = Db::open(&state.db_path)?;
+    let actions = db.recover_scan()?;
+    let mut n = 0;
+    for a in actions {
+        let action = a["action"].as_str().unwrap_or("");
+        let turn_id = a["turn_id"].as_str().unwrap_or("");
+        let room_id = a["room_id"].as_str().unwrap_or("");
+        let pid = a["persona_id"].as_str().unwrap_or("");
+        let attempt = a["attempt"].as_i64().unwrap_or(1);
+        match action {
+            "backfill" => {
+                let run = a["run"].clone();
+                db.complete_turn(turn_id, room_id, pid, &run, "{}", attempt, &bubble_text(&run))?;
+                n += 1;
+            }
+            "rerun" => {
+                // 快照优先；无快照（崩溃在 run 创建前）按触发原文重建任务卡
+                let mut task: Value = a
+                    .get("task_json")
+                    .and_then(Value::as_str)
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_else(|| {
+                        let room = db.get_room(room_id).unwrap_or(Value::Null);
+                        let persona = db.get_persona(pid).unwrap_or(Value::Null);
+                        json!({
+                            "worker": persona["engine"].as_str().unwrap_or(""),
+                            "workspace": room["cwd"].as_str().unwrap_or(""),
+                            "timeout_seconds": 300,
+                            "brief": a["brief"].as_str().unwrap_or(""),
+                        })
+                    });
+                let run_id = format!("run-{}", db::uuid8());
+                task["id"] = Value::from(run_id.clone());
+                if task.get("session_id").is_none() {
+                    if let Some(s) = db.last_session(room_id, pid) {
+                        task["session_id"] = Value::from(s);
+                    }
+                }
+                let result = run_task_impl(task.clone(), state).unwrap_or_else(|e| json!({
+                    "task_id": run_id, "status": "failed", "answer_text": "", "error": e,
+                }));
+                let bubble = bubble_text(&result);
+                db.complete_turn(turn_id, room_id, pid, &result, &task.to_string(), attempt, &bubble)?;
+                n += 1;
+            }
+            _ => {}
+        }
+    }
+    Ok(n)
 }
 
 // ---------- 无头自检（M0 验收：模拟 launchd 环境跑 doctor + 假 worker） ----------
@@ -424,6 +489,11 @@ fn selftest() -> i32 {
     // M2a-1 schema 迁移验收：AGENTCHAT_SELFTEST=migrate（可用 AGENTCHAT_MIGRATE_FIXTURE 指定真 M1 库副本）
     if std::env::var("AGENTCHAT_SELFTEST").as_deref() == Ok("migrate") {
         return selftest_migrate();
+    }
+
+    // M2a-2 lane 验收：AGENTCHAT_SELFTEST=lane（隔离临时库 + 假 worker）
+    if std::env::var("AGENTCHAT_SELFTEST").as_deref() == Ok("lane") {
+        return selftest_lane(&state);
     }
 
     // 假 worker 一轮（fake-bin/dsh 须在 PATH 前置目录中）
@@ -508,7 +578,7 @@ fn selftest_chat(state: &AppState) -> i32 {
     println!("[selftest-chat] dm room: {room_id} cwd={}", room["cwd"]);
 
     // 3) 第一轮：建立 session
-    let h1 = match send_message_core(&db, state, &room_id, "Reply with exactly one word: PONG. No punctuation.") {
+    let h1 = match send_message_core(&db, state, &room_id, "Reply with exactly one word: PONG. No punctuation.", None) {
         Ok(v) => v,
         Err(e) => return fail(&format!("round1: {e}")),
     };
@@ -529,7 +599,7 @@ fn selftest_chat(state: &AppState) -> i32 {
     let before = db
         .last_session(&room_id, &pid)
         .expect("session after round1");
-    let h2 = match send_message_core(&db, state, &room_id, "What did I ask you to reply in my previous message? Answer with that exact word only.") {
+    let h2 = match send_message_core(&db, state, &room_id, "What did I ask you to reply in my previous message? Answer with that exact word only.", None) {
         Ok(v) => v,
         Err(e) => return fail(&format!("round2: {e}")),
     };
@@ -579,14 +649,21 @@ pub fn run() {
         .setup(|app| {
             let root = ensure_kernel(Some(app.handle()))?;
             let path = login_path();
-            let db = Db::open(&mesh_data().join("agentchat.db"))?;
-            app.manage(AppState {
+            let db_path = mesh_data().join("agentchat.db");
+            Db::open(&db_path)?; // 提前触发 migrate
+            let state = AppState {
                 mesh_root: Mutex::new(root),
                 login_path: Mutex::new(path),
-                db_path: mesh_data().join("agentchat.db"),
+                db_path,
                 projects_root: projects_root(),
-            });
-            let _ = db; // 提前触发 migrate
+            };
+            // M2a-2 启动崩溃恢复：只补未完成 persona（补气泡/重跑缺失 run）
+            match recover_pending_turns(&state) {
+                Ok(n) if n > 0 => eprintln!("[agentchat] startup recovery: {n} action(s) replayed"),
+                Ok(_) => {}
+                Err(e) => eprintln!("[agentchat] startup recovery failed: {e}"),
+            }
+            app.manage(state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -838,9 +915,205 @@ fn verify_migrated(db: &Db, db_path: &Path) -> Result<(), String> {
         return Err("no backup file created".into());
     }
     // client_msg_id 自铸格式（msg-<26 字符 ulid>）
-    let (_, cmid) = db.add_message(&room_id, "user", "user", "selftest ulid", None, None)?;
+    let (_, cmid) = db.add_message(&room_id, "user", "user", "selftest ulid", None, None, None)?;
     if !cmid.starts_with("msg-") || cmid.len() != 30 {
         return Err(format!("client_msg_id format wrong: {cmid}"));
     }
     Ok(())
+}
+
+/// M2a-2 验收：lane + 三层幂等 + 崩溃恢复（隔离临时库，假 worker）
+/// 用例1：重复 client_msg_id → 不产生重复气泡/turn（第一层幂等）
+/// 用例2：崩溃于 run 成功后气泡前 → 恢复幂等补写气泡，不重跑（§4.3 完成事务恢复）
+/// 用例3：崩溃于 run 创建前 → 恢复按触发原文重建任务卡重跑，只补缺失 persona
+/// 用例4：run 失败/interrupted → 恢复按 attempt+1 重跑（§4.3 重试契约）
+fn selftest_lane(state0: &AppState) -> i32 {
+    let fail = |msg: &str| {
+        eprintln!("[selftest-lane] FAIL: {msg}");
+        1
+    };
+    let dir = std::env::temp_dir().join(format!("agentchat-lane-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        return fail(&format!("mkdir: {e}"));
+    }
+    let db_path = dir.join("agentchat.db");
+    let state = AppState {
+        mesh_root: Mutex::new(state0.mesh_root.lock().unwrap().clone()),
+        login_path: Mutex::new(state0.login_path.lock().unwrap().clone()),
+        db_path: db_path.clone(),
+        projects_root: dir.join("projects"),
+    };
+    let db = match Db::open(&db_path) {
+        Ok(d) => d,
+        Err(e) => return fail(&format!("db open: {e}")),
+    };
+    let personas = match db.bind_personas(&["dsh".to_string()]) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("bind_personas: {e}")),
+    };
+    let pid = personas[0]["id"].as_str().unwrap_or("").to_string();
+    let room = match db.open_dm(&pid, &state.projects_root) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("open_dm: {e}")),
+    };
+    let room_id = room["id"].as_str().unwrap_or("").to_string();
+    println!("[selftest-lane] room={room_id} persona={pid}");
+
+    let count = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> i64 {
+        db.0.query_row(sql, rusqlite::params_from_iter(p.iter()), |r| r.get(0))
+            .unwrap_or(-1)
+    };
+
+    // —— 用例1：重复 client_msg_id 幂等 ——
+    let cmid = "msg-LANEDUP000000000000000001";
+    let h1 = match send_message_core(&db, &state, &room_id, "lane dup test", Some(cmid)) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("case1 first send: {e}")),
+    };
+    let h2 = match send_message_core(&db, &state, &room_id, "lane dup test", Some(cmid)) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("case1 dup send: {e}")),
+    };
+    let user_msgs = count(
+        "SELECT COUNT(*) FROM messages WHERE room_id=? AND client_msg_id=?",
+        &[&room_id, &cmid],
+    );
+    let persona_bubbles = count(
+        "SELECT COUNT(*) FROM messages WHERE room_id=? AND role='persona'",
+        &[&room_id],
+    );
+    let turns_n = count("SELECT COUNT(*) FROM turns WHERE room_id=?", &[&room_id]);
+    println!("[selftest-lane] case1: history {} vs {}, user_msgs={user_msgs}, bubbles={persona_bubbles}, turns={turns_n}",
+        h1.as_array().map(|a| a.len()).unwrap_or(0),
+        h2.as_array().map(|a| a.len()).unwrap_or(0));
+    if user_msgs != 1 || persona_bubbles != 1 || turns_n != 1 {
+        return fail("case1: 重复 client_msg_id 产生了重复消息/气泡/turn");
+    }
+
+    // —— 用例2：run 成功但气泡缺失 → 幂等补写，不重跑 ——
+    let (_m2, _c2, turn2, created2) =
+        match db.add_user_message_turn(&room_id, "crash after run", None, &[pid.clone()]) {
+            Ok(v) => v,
+            Err(e) => return fail(&format!("case2 turn: {e}")),
+        };
+    if !created2 {
+        return fail("case2: turn 未创建");
+    }
+    let run2 = json!({"task_id": "run-crash2", "status": "success", "answer_text": "CRASH2-ANSWER"});
+    if let Err(e) = db.add_run(&run2, &room_id, &pid, "{}", Some(&turn2), 1) {
+        return fail(&format!("case2 add_run: {e}"));
+    }
+    // 模拟崩溃：run 已落库，气泡与 turn 终态未写
+    let n = match recover_pending_turns(&state) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("case2 recover: {e}")),
+    };
+    let bubbles2 = count(
+        "SELECT COUNT(*) FROM messages WHERE room_id=? AND turn_id=? AND sender=?",
+        &[&room_id, &turn2, &pid],
+    );
+    let turn2_status: String = db
+        .0
+        .query_row(
+            "SELECT status FROM turns WHERE turn_id=?",
+            rusqlite::params![turn2],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    println!("[selftest-lane] case2: recovery actions={n}, bubbles={bubbles2}, turn={turn2_status}");
+    if n != 1 || bubbles2 != 1 || turn2_status != "done" {
+        return fail("case2: 气泡补写/turn 终态不符预期");
+    }
+    // 幂等：再次恢复 0 动作，气泡仍只有一条，run 仍只有一次（未重跑）
+    let n2 = match recover_pending_turns(&state) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("case2 recover#2: {e}")),
+    };
+    let runs2 = count(
+        "SELECT COUNT(*) FROM runs WHERE turn_id=? AND persona_id=?",
+        &[&turn2, &pid],
+    );
+    let bubbles2b = count(
+        "SELECT COUNT(*) FROM messages WHERE room_id=? AND turn_id=? AND sender=?",
+        &[&room_id, &turn2, &pid],
+    );
+    if n2 != 0 || runs2 != 1 || bubbles2b != 1 {
+        return fail("case2: 恢复不幂等（重复补写/重跑）");
+    }
+
+    // —— 用例3：崩溃于 run 创建前 → 重建任务卡重跑 ——
+    let (_m3, _c3, turn3, _) =
+        match db.add_user_message_turn(&room_id, "crash before run", None, &[pid.clone()]) {
+            Ok(v) => v,
+            Err(e) => return fail(&format!("case3 turn: {e}")),
+        };
+    let n3 = match recover_pending_turns(&state) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("case3 recover: {e}")),
+    };
+    let runs3 = count(
+        "SELECT COUNT(*) FROM runs WHERE turn_id=? AND persona_id=? AND status='success'",
+        &[&turn3, &pid],
+    );
+    let bubbles3 = count(
+        "SELECT COUNT(*) FROM messages WHERE room_id=? AND turn_id=? AND sender=?",
+        &[&room_id, &turn3, &pid],
+    );
+    let turn3_status: String = db
+        .0
+        .query_row(
+            "SELECT status FROM turns WHERE turn_id=?",
+            rusqlite::params![turn3],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    println!("[selftest-lane] case3: recovery actions={n3}, success runs={runs3}, bubbles={bubbles3}, turn={turn3_status}");
+    if n3 != 1 || runs3 != 1 || bubbles3 != 1 || turn3_status != "done" {
+        return fail("case3: 缺失 run 重跑/终态不符预期");
+    }
+
+    // —— 用例4：failed run → attempt+1 重跑（第三层幂等：(turn_id,persona_id,attempt)）——
+    let (_m4, _c4, turn4, _) =
+        match db.add_user_message_turn(&room_id, "retry after fail", None, &[pid.clone()]) {
+            Ok(v) => v,
+            Err(e) => return fail(&format!("case4 turn: {e}")),
+        };
+    let run4 = json!({"task_id": "run-fail4", "status": "failed", "answer_text": ""});
+    let snap4 = json!({"id": "run-fail4", "worker": "dsh", "timeout_seconds": 60, "brief": "retry after fail"});
+    if let Err(e) = db.add_run(&run4, &room_id, &pid, &snap4.to_string(), Some(&turn4), 1) {
+        return fail(&format!("case4 add_run: {e}"));
+    }
+    let n4 = match recover_pending_turns(&state) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("case4 recover: {e}")),
+    };
+    let attempt2_ok = count(
+        "SELECT COUNT(*) FROM runs WHERE turn_id=? AND persona_id=? AND attempt=2 AND status='success'",
+        &[&turn4, &pid],
+    );
+    let turn4_status: String = db
+        .0
+        .query_row(
+            "SELECT status FROM turns WHERE turn_id=?",
+            rusqlite::params![turn4],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    println!("[selftest-lane] case4: recovery actions={n4}, attempt2 success={attempt2_ok}, turn={turn4_status}");
+    if n4 != 1 || attempt2_ok != 1 || turn4_status != "done" {
+        return fail("case4: attempt+1 重跑不符预期");
+    }
+    // 最终幂等：全库再无悬挂 turn
+    let dangling = count(
+        "SELECT COUNT(*) FROM turns WHERE status IN ('claimed','running')",
+        &[],
+    );
+    if dangling != 0 {
+        return fail("final: 仍有悬挂 turn");
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+    println!("[selftest-lane] PASS (4 cases)");
+    0
 }

@@ -560,8 +560,8 @@ impl Db {
         Ok(Value::Array(out))
     }
 
-    /// 写入消息：client_msg_id 由本层自铸（§4.11 msg-<ulid>），
-    /// UNIQUE(room_id, client_msg_id) 幂等——重复提交返回既有消息 id。
+    /// 写入消息：client_msg_id 可由调用方（前端）传入以支持重试幂等（§4.11），
+    /// 未传则由本层自铸 msg-<ulid>。UNIQUE(room_id, client_msg_id) 幂等——重复提交返回既有消息 id。
     /// turn_id / legacy_run_id 二选一携带（M2a-2 前气泡走 legacy_run_id 关联）。
     pub fn add_message(
         &self,
@@ -571,8 +571,9 @@ impl Db {
         text: &str,
         turn_id: Option<&str>,
         legacy_run_id: Option<&str>,
+        client_msg_id: Option<&str>,
     ) -> Result<(i64, String), String> {
-        let client_msg_id = format!("msg-{}", ulid());
+        let client_msg_id = client_msg_id.map(str::to_string).unwrap_or_else(|| format!("msg-{}", ulid()));
         self.0
             .execute(
                 "INSERT INTO messages(room_id,sender,role,text,turn_id,client_msg_id,legacy_run_id,created_at)
@@ -674,44 +675,357 @@ impl Db {
             .map_err(|e| e.to_string())?;
         if run["status"].as_str() == Some("success") {
             if let Some(session_id) = run["session_id"].as_str() {
-                let existing: Option<(String, String)> = self
-                    .0
-                    .query_row(
-                        "SELECT session_id, COALESCE(archived,'[]') FROM room_persona_sessions
-                         WHERE room_id=?1 AND persona_id=?2",
-                        params![room_id, persona_id],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .ok();
-                match existing {
-                    Some((old, archived)) if old != session_id => {
-                        // 更换 session：旧值写入 archived（不静默替换，可审计）
-                        let mut arr: Vec<Value> =
-                            serde_json::from_str(&archived).unwrap_or_default();
-                        arr.push(json!({"session_id": old, "replaced_at": now()}));
-                        self.0
-                            .execute(
-                                "UPDATE room_persona_sessions SET session_id=?3, archived=?4, status='active'
-                                 WHERE room_id=?1 AND persona_id=?2",
-                                params![room_id, persona_id, session_id, serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())],
-                            )
-                            .map_err(|e| e.to_string())?;
-                    }
-                    Some(_) => {}
-                    None => {
-                        self.0
-                            .execute(
-                                "INSERT INTO room_persona_sessions(room_id,persona_id,session_id,status,created_at)
-                                 VALUES(?1,?2,?3,'active',?4)",
-                                params![room_id, persona_id, session_id, now()],
-                            )
-                            .map_err(|e| e.to_string())?;
-                    }
-                }
+                upsert_session(&self.0, room_id, persona_id, session_id)?;
             }
         }
         Ok(())
     }
+
+    // ---------- M2a-2：房间 lane（turns 持久化 + 完成事务 + 崩溃恢复） ----------
+
+    /// §6.2.1 消息+turn 同事务：用户消息落库与 turn 创建不可分割。
+    /// 幂等（§4.11 第一层）：重复 client_msg_id → 同一条消息、同一个 turn（created=false），
+    /// 由调用方决定不再消费（绝不双跑）。返回 (msg_id, client_msg_id, turn_id, created)。
+    pub fn add_user_message_turn(
+        &self,
+        room_id: &str,
+        text: &str,
+        client_msg_id: Option<&str>,
+        target_personas: &[String],
+    ) -> Result<(i64, String, String, bool), String> {
+        let cmid = client_msg_id
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("msg-{}", ulid()));
+        let tx = self.0.unchecked_transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO messages(room_id,sender,role,text,client_msg_id,created_at)
+             VALUES(?1,'user','user',?2,?3,?4)
+             ON CONFLICT(room_id, client_msg_id) DO NOTHING",
+            params![room_id, text, cmid, now()],
+        )
+        .map_err(|e| e.to_string())?;
+        let msg_id: i64 = tx
+            .query_row(
+                "SELECT id FROM messages WHERE room_id=?1 AND client_msg_id=?2",
+                params![room_id, cmid],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        // 该消息已有 turn？（重试场景：同 client_msg_id → 同一 turn，绝不双消费）
+        let trig = format!("[{msg_id}]");
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT turn_id FROM turns WHERE room_id=?1 AND trigger_msg_ids=?2",
+                params![room_id, trig],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(tid) = existing {
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok((msg_id, cmid, tid, false));
+        }
+        let turn_id = format!("turn-{}", ulid());
+        let lane_seq: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(lane_seq),0)+1 FROM turns WHERE room_id=?1",
+                params![room_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let targets =
+            serde_json::to_string(target_personas).unwrap_or_else(|_| "[]".into());
+        tx.execute(
+            "INSERT INTO turns(turn_id,room_id,trigger_msg_ids,target_personas,status,lane_seq,claimed_at,lease_until,attempt,created_at)
+             VALUES(?1,?2,?3,?4,'claimed',?5,?6,?7,1,?6)",
+            params![turn_id, room_id, trig, targets, lane_seq, now(), now_plus(LANE_LEASE_S)],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok((msg_id, cmid, turn_id, true))
+    }
+
+    /// §4.3 完成事务（codex BLOCKER）：run 落库 + persona 气泡 + turn 终态 = 单事务。
+    /// 幂等：run 按 (turn_id,persona_id,attempt) ON CONFLICT DO NOTHING（§4.11 第三层）；
+    /// 气泡按 (room_id,turn_id,sender) 查重——崩溃恢复重放不写第二条。
+    /// turn 终态：本 run 失败 → failed；所有目标 persona 均有 success run → done；否则保持 claimed。
+    pub fn complete_turn(
+        &self,
+        turn_id: &str,
+        room_id: &str,
+        persona_id: &str,
+        run: &Value,
+        task_json: &str,
+        attempt: i64,
+        bubble: &str,
+    ) -> Result<(), String> {
+        let tx = self.0.unchecked_transaction().map_err(|e| e.to_string())?;
+        let run_id = run["task_id"].as_str().unwrap_or("").to_string();
+        tx.execute(
+            "INSERT INTO runs(id,room_id,persona_id,task_json,status,session_id,tokens,duration_s,synthesized,answer_text,turn_id,attempt,created_at,finished_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+             ON CONFLICT(turn_id,persona_id,attempt) WHERE turn_id IS NOT NULL DO NOTHING",
+            params![
+                run_id, room_id, persona_id, task_json,
+                run["status"].as_str().unwrap_or("failed"),
+                run["session_id"].as_str(),
+                run["tokens"].as_i64(),
+                run["duration_s"].as_f64(),
+                if run["synthesized"].as_bool().unwrap_or(false) { 1 } else { 0 },
+                run["answer_text"].as_str().unwrap_or(""),
+                turn_id, attempt,
+                run["started_at"].as_str().map(String::from).unwrap_or_else(now),
+                run["finished_at"].as_str().map(String::from).unwrap_or_else(now),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        let ok = run["status"].as_str() == Some("success");
+        if ok {
+            if let Some(sid) = run["session_id"].as_str() {
+                upsert_session(&tx, room_id, persona_id, sid)?;
+            }
+        }
+        // 气泡（幂等：同 turn 同 persona 只写一次）
+        let has_bubble: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE room_id=?1 AND turn_id=?2 AND sender=?3",
+                params![room_id, turn_id, persona_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if has_bubble == 0 {
+            tx.execute(
+                "INSERT INTO messages(room_id,sender,role,text,turn_id,client_msg_id,legacy_run_id,created_at)
+                 VALUES(?1,?2,'persona',?3,?4,?5,?6,?7)",
+                params![room_id, persona_id, bubble, turn_id, format!("msg-{}", ulid()), run_id, now()],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        // turn 终态：失败即 failed；全部目标 success 才 done（DM 单目标即时终态）
+        let targets_json: String = tx
+            .query_row(
+                "SELECT target_personas FROM turns WHERE turn_id=?1",
+                params![turn_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let targets: Vec<String> = serde_json::from_str(&targets_json).unwrap_or_default();
+        let success_n: i64 = tx
+            .query_row(
+                "SELECT COUNT(DISTINCT persona_id) FROM runs WHERE turn_id=?1 AND status='success'",
+                params![turn_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let (status, last_err): (&str, Option<String>) = if !ok {
+            ("failed", Some(format!("{} run failed", persona_id)))
+        } else if success_n >= targets.len() as i64 {
+            ("done", None)
+        } else {
+            ("claimed", None)
+        };
+        if status != "claimed" {
+            tx.execute(
+                "UPDATE turns SET status=?2, completed_at=?3, attempt=?4, last_error=?5 WHERE turn_id=?1",
+                params![turn_id, status, now(), attempt, last_err],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// §6.2.1 崩溃恢复扫描：非终态 turn（claimed/running）逐 persona 判定恢复动作。
+    /// - 无结果的 running run → 先标 interrupted（§4.3 重试契约）；
+    /// - run 成功但气泡缺失 → backfill（幂等补写，不重跑）；
+    /// - run 缺失/失败/interrupted → rerun（attempt+1，重试=同 turn 新 attempt 新 run_id）。
+    /// 只补未完成的 persona，不重跑已成功 run。返回动作清单供调用方执行。
+    pub fn recover_scan(&self) -> Result<Vec<Value>, String> {
+        let mut out: Vec<Value> = Vec::new();
+        let mut st = self
+            .0
+            .prepare(
+                "SELECT turn_id, room_id, target_personas, trigger_msg_ids, attempt FROM turns
+                 WHERE status IN ('claimed','running') ORDER BY room_id, lane_seq",
+            )
+            .map_err(|e| e.to_string())?;
+        let turns: Vec<(String, String, String, String, i64)> = st
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|x| x.ok())
+            .collect();
+        drop(st);
+        let mut busy_turns: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (turn_id, room_id, targets_json, trig_json, turn_attempt) in turns {
+            let targets: Vec<String> = serde_json::from_str(&targets_json).unwrap_or_default();
+            for persona_id in targets {
+                // 无结果 running → interrupted
+                self.0
+                    .execute(
+                        "UPDATE runs SET status='interrupted' WHERE turn_id=?1 AND persona_id=?2 AND status='running'",
+                        params![turn_id, persona_id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                let latest: Option<(String, String, i64, String)> = self
+                    .0
+                    .query_row(
+                        "SELECT id, COALESCE(status,'failed'), attempt, task_json FROM runs
+                         WHERE turn_id=?1 AND persona_id=?2 ORDER BY attempt DESC LIMIT 1",
+                        params![turn_id, persona_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )
+                    .ok();
+                match latest {
+                    None => {
+                        busy_turns.insert(turn_id.clone());
+                        // 无快照（崩溃在 run 创建前）：带触发消息原文供调用方重建任务卡
+                        let brief = trigger_brief(&self.0, &trig_json);
+                        out.push(json!({
+                            "turn_id": turn_id, "room_id": room_id, "persona_id": persona_id,
+                            "action": "rerun", "attempt": turn_attempt, "brief": brief,
+                        }));
+                    }
+                    Some((rid, status, attempt, _task_json)) if status == "success" => {
+                        let has_bubble: i64 = self
+                            .0
+                            .query_row(
+                                "SELECT COUNT(*) FROM messages WHERE room_id=?1 AND turn_id=?2 AND sender=?3",
+                                params![room_id, turn_id, persona_id],
+                                |r| r.get(0),
+                            )
+                            .unwrap_or(0);
+                        if has_bubble == 0 {
+                            busy_turns.insert(turn_id.clone());
+                            let ans: String = self
+                                .0
+                                .query_row(
+                                    "SELECT COALESCE(answer_text,'') FROM runs WHERE id=?1",
+                                    params![rid],
+                                    |r| r.get(0),
+                                )
+                                .map_err(|e| e.to_string())?;
+                            out.push(json!({
+                                "turn_id": turn_id, "room_id": room_id, "persona_id": persona_id,
+                                "action": "backfill", "attempt": attempt,
+                                "run": {"task_id": rid, "status": "success", "answer_text": ans},
+                            }));
+                        }
+                    }
+                    Some((_rid, _status, attempt, task_json)) => {
+                        busy_turns.insert(turn_id.clone());
+                        out.push(json!({
+                            "turn_id": turn_id, "room_id": room_id, "persona_id": persona_id,
+                            "action": "rerun", "attempt": attempt + 1, "task_json": task_json,
+                        }));
+                    }
+                }
+            }
+        }
+        // 收尾 sweep：无待办动作的悬挂 turn（全部 persona 已 success+气泡）直接终态化
+        let mut st2 = self
+            .0
+            .prepare("SELECT turn_id FROM turns WHERE status IN ('claimed','running')")
+            .map_err(|e| e.to_string())?;
+        let dangling: Vec<String> = st2
+            .query_map([], |r| r.get(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(|x| x.ok())
+            .collect();
+        drop(st2);
+        for tid in dangling {
+            if !busy_turns.contains(&tid) {
+                self.0
+                    .execute(
+                        "UPDATE turns SET status='done', completed_at=?2 WHERE turn_id=?1",
+                        params![tid, now()],
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// lane claim 租约秒数（覆盖内核 timeout_seconds=300 + 余量）
+const LANE_LEASE_S: i64 = 330;
+
+/// now() + n 秒（同 ISO8601 UTC 格式，供 lease_until 比较）
+fn now_plus(secs: i64) -> String {
+    unsafe {
+        let t = libc::time(std::ptr::null_mut()) + secs;
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::gmtime_r(&t, &mut tm);
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        )
+    }
+}
+
+/// room_persona_sessions 维护：换 session 旧值进 archived JSON（§4.3，不静默替换，可审计）。
+/// 自由函数，供 add_run 与 complete_turn（事务内）共用。
+fn upsert_session(
+    conn: &Connection,
+    room_id: &str,
+    persona_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let existing: Option<(String, String)> = conn
+        .query_row(
+            "SELECT session_id, COALESCE(archived,'[]') FROM room_persona_sessions
+             WHERE room_id=?1 AND persona_id=?2",
+            params![room_id, persona_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    match existing {
+        Some((old, archived)) if old != session_id => {
+            let mut arr: Vec<Value> = serde_json::from_str(&archived).unwrap_or_default();
+            arr.push(json!({"session_id": old, "replaced_at": now()}));
+            conn.execute(
+                "UPDATE room_persona_sessions SET session_id=?3, archived=?4, status='active'
+                 WHERE room_id=?1 AND persona_id=?2",
+                params![
+                    room_id,
+                    persona_id,
+                    session_id,
+                    serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Some(_) => {}
+        None => {
+            conn.execute(
+                "INSERT INTO room_persona_sessions(room_id,persona_id,session_id,status,created_at)
+                 VALUES(?1,?2,?3,'active',?4)",
+                params![room_id, persona_id, session_id, now()],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// 取触发消息原文（trigger_msg_ids JSON 数组的第一条），供崩溃恢复重建任务卡
+fn trigger_brief(conn: &Connection, trig_json: &str) -> String {
+    let ids: Vec<i64> = serde_json::from_str(trig_json).unwrap_or_default();
+    ids.first()
+        .and_then(|id| {
+            conn.query_row(
+                "SELECT text FROM messages WHERE id=?1",
+                params![id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        })
+        .unwrap_or_default()
 }
 
 /// ALTER TABLE ADD COLUMN（幂等：列已存在则跳过）

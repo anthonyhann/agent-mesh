@@ -14,6 +14,7 @@
 - **v2.3 → v2.4**：codex 四轮（1 BLOCKER/2 MAJOR/6 MINOR）吸收：① **完成事务**定义（§4.3）：run 完成+回复气泡插入+turn persona 终态=单事务；恢复时发现 `runs.status=success` 但气泡缺失 → 按 `(turn_id, persona_id, attempt)` 幂等补写；② `room_history` join 规则定型（persona 消息按 turn_id+sender 取最新 attempt，user 消息不 join run）；③ 目标解析降级对每级生效（@ 无效→提示终止；default/last/owner 逐级跳过；全无效→系统提示不静默丢）；④ `room_persona_sessions` 换 session 时旧值入 `archived` JSON 列不静默替换；⑤ 迁移同步维护 `sqlite_sequence`、摘要游标与 messages 重建同事务、备份目录 0700+保留最近 5 份。
 
 - **v2.4 → M2a-1 实施（2026-11-26）**：内核补一处会话契约修复——续聊任务结果 `session_id` 兜底为任务卡传入值（dsh 续接不改 session 目录 mtime，mtime 启发式在纯续接场景丢 id；结果 envelope §4.2 本就承诺 session_id）。
+- **v2.4 → M2a-2 实施（2026-11-26）**：① lane 落地——`add_user_message_turn`（消息+turn 单事务，重复 client_msg_id 复用既有 turn 绝不双消费）、`complete_turn`（§4.3 完成事务：run 落库+气泡+turn 终态单 SQLite 事务；run 按 `(turn_id,persona_id,attempt)` ON CONFLICT DO NOTHING，气泡按 `(room_id,turn_id,sender)` 查重幂等）、`recover_scan`+`recover_pending_turns`（启动崩溃恢复：无结果 running→interrupted；run 成功缺气泡→幂等补写不重跑；run 缺失/failed→按 attempt+1 重跑，快照优先无快照按触发原文重建任务卡）；② send_message 全链路改走 lane，执行失败也落 failed 终态不悬挂 turn；③ UI 重做对齐 ClawChat——持久三栏暗色骨架（icon rail+会话列表+聊天区）、搜索框+「添加 Agent」卡、在线绿点+权限徽标、右侧用户蓝气泡+H 头像、时间分隔、三点 typing 动画、输入区工具条（⚡📎占位）+➤发送、前端自铸 clientMsgId 重试复用（§4.11 第一层幂等贯通到 UI）、窗口 1024×680(min 880×560)。验收：selftest_lane 四用例（重复提交单气泡 / 崩溃补写不重跑 / 崩溃重跑只补缺失 / failed→attempt+1）PASS；selftest_chat 真 dsh 两轮续聊回归 PASS；selftest_migrate 回归 PASS。
 
 ### 0.1 内核改动清单（有界，仅 K0-K4，全部向后兼容 + smoke 回归）
 
@@ -344,7 +345,7 @@ worker 均为高权限模式（dsh `--approval-policy never`、claude `bypassPer
 | **M0 环境基座** ✅(2026-11-26) | 双根 + launcher + doctor + 假 worker + K0/K1/K2 内核改动及回归 | `tauri build` .app Finder 启动全链路绿；watchdog 合成 timeout 用例通过（38s=3+30+5 验证预算公式）；内核 timeout 路径 exit 124 验证；证书申请启动（待办） |
 | **M1 绑定+私聊闭环** ✅(2026-11-26) | 绑定向导 + 会话列表 + 私聊对话框（真 dsh）+ SQLite 全表 + 完成协议 | 两轮真对话 session 续接验证通过；重启恢复；history 4 条 |
 | **M2a-1 迁移+ID** ✅(2026-11-26) | §4.10 schema 迁移（user_version+`VACUUM INTO` 备份+messages 重建 backfill+legacy_run_id 保留）+ `turns`/`room_members`/`room_summaries` 建表 + 三类 ID 分离 | M1 旧 DB 升级后历史可打开、旧气泡 status/tokens 不丢、session 不丢 |
-| **M2a-2 lane+幂等** | lane 串行（turns 表持久化+lease+崩溃恢复：只补未完成 persona）+ 消息+turn 同事务 + 三层幂等（client_msg_id/turn_id/turn_id+persona_id） | 重复提交不产生重复气泡；崩溃后 lane 从 DB 恢复且不重跑已完成 run |
+| **M2a-2 lane+幂等** ✅(2026-11-26) | lane 串行（turns 表持久化+lease+崩溃恢复：只补未完成 persona）+ 消息+turn 同事务 + 三层幂等（client_msg_id/turn_id/turn_id+persona_id） | 重复提交不产生重复气泡；崩溃后 lane 从 DB 恢复且不重跑已完成 run |
 | **M2a-3 异步+打断** | send_message 改异步 command+event（typing 节奏 1.5s/6s）+ **§6.8 即时打断**（停止按钮+killpg+cancelled 合成记录） | typing 6s 熄灭；停止按钮杀 run 落 cancelled，lane 继续 |
 | **M2b 私聊全量** | 8 engine 全接入（§4.5 并发矩阵+K3）+ persona 多开 + behavior.md 编辑 + IM 质感（名片/在线状态/最近发言）+ 失败引导 | 每 engine 一轮私聊从打包 app 通过；同 engine 双 persona 各自续聊不串台；smoke 修 qwen/pi |
 | **M3a 群聊房间** | 建群 + 房间项目文件夹 + 三闸门（禁言/活跃度+合并窗口/自动轮数）+ 目标解析链 + coalescer 与 lane 同 actor + **codex 群会话第一天起强制 read-only**（不留权限窗口） | 3 persona 群：mention 未 @ 静默；all 合并窗口攒批单人回复；@ 立即派发且批次不重复；codex 群会话 read-only 生效 |

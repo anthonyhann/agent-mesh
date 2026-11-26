@@ -4,21 +4,23 @@ import { invoke } from "@tauri-apps/api/core";
 interface Persona { id: string; engine: string; name: string; color: string; bound: boolean }
 interface Room {
   id: string; kind: string; name: string; members: string[]; cwd: string;
-  permission: string; default_target: string;
+  permission: string; reply_mode: string;
   last_message?: string | null; last_at?: string | null; last_sender?: string | null;
 }
 interface Msg {
-  id: number; sender: string; role: string; text: string; run_id?: string | null;
+  id: number; sender: string; role: string; text: string;
+  turn_id?: string | null; run_id?: string | null; client_msg_id?: string | null;
   created_at: string; status?: string | null; tokens?: number | null;
   duration_s?: number | null; session_id?: string | null;
 }
 interface Doctor { tools: Record<string, string | null>; auth: Record<string, boolean>; mesh_root: string; path: string }
 
-type View = { name: "bind" } | { name: "home" } | { name: "chat"; room: Room };
-
 export default function App() {
   const [personas, setPersonas] = useState<Persona[]>([]);
-  const [view, setView] = useState<View>({ name: "home" });
+  const [rooms, setRooms] = useState<Room[]>([]);
+  const [activeRoom, setActiveRoom] = useState<Room | null>(null);
+  const [tab, setTab] = useState<"chat" | "contacts">("chat");
+  const [showBind, setShowBind] = useState(false);
   const [booted, setBooted] = useState(false);
 
   const refreshPersonas = useCallback(async () => {
@@ -26,27 +28,155 @@ export default function App() {
     setPersonas(ps);
     return ps;
   }, []);
+  const refreshRooms = useCallback(async () => {
+    const rs = await invoke<Room[]>("list_rooms");
+    setRooms(rs);
+    return rs;
+  }, []);
 
   useEffect(() => {
     (async () => {
       const ps = await refreshPersonas();
-      setView(ps.length === 0 ? { name: "bind" } : { name: "home" });
+      await refreshRooms();
+      setShowBind(ps.length === 0);
       setBooted(true);
     })();
-  }, [refreshPersonas]);
+  }, [refreshPersonas, refreshRooms]);
+
+  const openDm = useCallback(async (personaId: string) => {
+    const room = await invoke<Room>("open_dm", { personaId });
+    await refreshRooms();
+    setActiveRoom(room);
+    setTab("chat");
+  }, [refreshRooms]);
 
   if (!booted) return <div className="boot">🐈‍⬛ AgentChat 启动中…</div>;
-  if (view.name === "bind")
-    return <BindWizard onDone={async () => { await refreshPersonas(); setView({ name: "home" }); }} />;
-  if (view.name === "chat")
-    return <ChatView room={view.room} personas={personas} onBack={() => setView({ name: "home" })} />;
-  return <Home personas={personas} onOpenRoom={(room) => setView({ name: "chat", room })}
-    onBindMore={() => setView({ name: "bind" })} />;
+
+  return (
+    <div className="app">
+      {/* 左：icon rail */}
+      <nav className="rail">
+        <button className={`rail-btn ${tab === "chat" ? "on" : ""}`} title="聊天" onClick={() => setTab("chat")}>💬</button>
+        <button className={`rail-btn ${tab === "contacts" ? "on" : ""}`} title="联系人" onClick={() => setTab("contacts")}>🤖</button>
+        <div className="rail-spacer" />
+        <button className="rail-btn" title="绑定 Agent" onClick={() => setShowBind(true)}>➕</button>
+      </nav>
+
+      {/* 中：列表栏 */}
+      <aside className="sidebar">
+        {tab === "chat" ? (
+          <SessionList rooms={rooms} personas={personas} activeId={activeRoom?.id ?? null}
+            onSelect={(r) => setActiveRoom(r)} onBind={() => setShowBind(true)} />
+        ) : (
+          <ContactList personas={personas} onDm={openDm} onBind={() => setShowBind(true)} />
+        )}
+      </aside>
+
+      {/* 右：聊天区 */}
+      <main className="main">
+        {activeRoom ? (
+          <ChatView key={activeRoom.id} room={activeRoom} personas={personas}
+            onSent={refreshRooms} />
+        ) : (
+          <div className="placeholder">
+            <div className="ph-logo">🐈‍⬛</div>
+            <div className="ph-text">选择一个会话，或从联系人发起私聊</div>
+          </div>
+        )}
+      </main>
+
+      {showBind && (
+        <BindWizard onClose={async (done) => {
+          setShowBind(false);
+          if (done) { await refreshPersonas(); await refreshRooms(); }
+        }} />
+      )}
+    </div>
+  );
 }
 
-/* ---------- 绑定向导（M1：检测 8 CLI + auth → 勾选绑定） ---------- */
+/* ---------- 会话列表 ---------- */
 
-function BindWizard({ onDone }: { onDone: () => void }) {
+function SessionList({ rooms, personas, activeId, onSelect, onBind }:
+  { rooms: Room[]; personas: Persona[]; activeId: string | null; onSelect: (r: Room) => void; onBind: () => void }) {
+  const [q, setQ] = useState("");
+  const filtered = rooms.filter((r) =>
+    !q || r.name.toLowerCase().includes(q.toLowerCase()) || (r.last_message ?? "").toLowerCase().includes(q.toLowerCase()));
+  const personaOf = (id: string) => personas.find((p) => p.id === id);
+
+  return (
+    <>
+      <div className="search"><input placeholder="搜索会话" value={q} onChange={(e) => setQ(e.target.value)} /></div>
+      <div className="add-agent" onClick={onBind}>
+        <div className="add-icon">➕</div><div className="add-text">添加 Agent</div>
+      </div>
+      <div className="list">
+        {filtered.length === 0 && <div className="empty">还没有会话</div>}
+        {filtered.map((r) => {
+          const first = r.members[0] ? personaOf(r.members[0]) : undefined;
+          return (
+            <div key={r.id} className={`conv ${activeId === r.id ? "on" : ""}`} onClick={() => onSelect(r)}>
+              <Avatar name={r.name} color={first?.color ?? "#8e8e93"} group={r.kind === "group"} />
+              <div className="conv-main">
+                <div className="conv-name">{r.name}</div>
+                <div className="conv-last">{previewOf(r)}</div>
+              </div>
+              <div className="conv-at">{fmtListTime(r.last_at)}</div>
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+function previewOf(r: Room): string {
+  if (!r.last_message) return "（空会话）";
+  const oneLine = r.last_message.replace(/\n/g, " ");
+  return oneLine.length > 60 ? oneLine.slice(0, 60) + "…" : oneLine;
+}
+
+function fmtListTime(at?: string | null): string {
+  if (!at) return "";
+  // created_at 是 UTC ISO：就地显示 HH:MM（今天）或 MM-DD
+  const d = new Date(at);
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  if (sameDay) return `${hh}:${mm}`;
+  return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/* ---------- 联系人 ---------- */
+
+function ContactList({ personas, onDm, onBind }:
+  { personas: Persona[]; onDm: (id: string) => void; onBind: () => void }) {
+  return (
+    <>
+      <div className="sidebar-title">联系人 · {personas.length}</div>
+      <div className="add-agent" onClick={onBind}>
+        <div className="add-icon">➕</div><div className="add-text">添加 Agent</div>
+      </div>
+      <div className="list">
+        {personas.map((p) => (
+          <div key={p.id} className="conv" onClick={() => onDm(p.id)}>
+            <Avatar name={p.name} color={p.color} />
+            <div className="conv-main">
+              <div className="conv-name">{p.name}</div>
+              <div className="conv-last">{p.engine} · 在线</div>
+            </div>
+            <span className="online-dot" />
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+/* ---------- 绑定向导（弹层） ---------- */
+
+function BindWizard({ onClose }: { onClose: (done: boolean) => void }) {
   const [doctor, setDoctor] = useState<Doctor | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
@@ -54,7 +184,6 @@ function BindWizard({ onDone }: { onDone: () => void }) {
   useEffect(() => {
     invoke<Doctor>("doctor").then((d) => {
       setDoctor(d);
-      // 默认勾选 CLI 存在的 engine
       const avail = Object.entries(d.tools)
         .filter(([k, v]) => v !== null && ["dsh","codex","opencode","hermes","arkcli","qwen","pi","claude"].includes(k))
         .map(([k]) => k);
@@ -67,92 +196,40 @@ function BindWizard({ onDone }: { onDone: () => void }) {
     dsh: "DeepSeek Harness", codex: "Codex", opencode: "OpenCode", hermes: "Hermes",
     arkcli: "豆包 arkcli", qwen: "千问", pi: "Pi", claude: "Claude Code",
   };
-
   const toggle = (e: string) =>
     setSelected((s) => { const n = new Set(s); n.has(e) ? n.delete(e) : n.add(e); return n; });
 
   return (
-    <div className="wizard">
-      <div className="logo">🐈‍⬛</div>
-      <h1>绑定你的本地 Agent</h1>
-      <p className="sub">检测到的 CLI 已自动勾选；未安装/未登录的可稍后补绑。它们将成为你的联系人。</p>
-      <div className="engine-list">
-        {engines.map((e) => {
-          const path = doctor?.tools?.[e];
-          return (
-            <label key={e} className={`engine ${path ? "" : "disabled"}`}>
-              <input type="checkbox" checked={selected.has(e)} disabled={!path} onChange={() => toggle(e)} />
-              <span className="ename">{labels[e]}</span>
-              <span className="estat">{path ? "✅ 已检测" : "⬜ 未安装"}</span>
-            </label>
-          );
-        })}
-      </div>
-      <button className="primary" disabled={busy || selected.size === 0}
-        onClick={async () => { setBusy(true); await invoke("bind_personas", { engines: [...selected] }); onDone(); }}>
-        {busy ? "绑定中…" : `绑定 ${selected.size} 个 Agent，进入圆桌派 →`}
-      </button>
-    </div>
-  );
-}
-
-/* ---------- 首页：会话列表（微信式） + 联系人 ---------- */
-
-function Home({ personas, onOpenRoom, onBindMore }:
-  { personas: Persona[]; onOpenRoom: (r: Room) => void; onBindMore: () => void }) {
-  const [rooms, setRooms] = useState<Room[]>([]);
-  const refresh = useCallback(() => invoke<Room[]>("list_rooms").then(setRooms), []);
-  useEffect(() => { refresh(); }, [refresh]);
-
-  const personaOf = (id: string) => personas.find((p) => p.id === id);
-
-  return (
-    <div className="home">
-      <header className="topbar">
-        <span className="brand">🐈‍⬛ 圆桌派</span>
-        <button className="link" onClick={onBindMore}>＋ 绑定 Agent</button>
-      </header>
-
-      <section className="section-title">会话</section>
-      {rooms.length === 0 && <div className="empty">还没有会话。从下方联系人发起私聊，或建一个群。</div>}
-      {rooms.map((r) => {
-        const first = r.members[0] ? personaOf(r.members[0]) : undefined;
-        return (
-          <div key={r.id} className="room" onClick={() => onOpenRoom(r)}>
-            <Avatar name={r.name} color={first?.color ?? "#8e8e93"} group={r.kind === "group"} />
-            <div className="room-main">
-              <div className="room-name">{r.name}</div>
-              <div className="room-last">{r.last_message ?? "（空会话）"}</div>
-            </div>
-            <div className="room-at">{r.last_at?.slice(5, 16).replace("T", " ") ?? ""}</div>
-          </div>
-        );
-      })}
-
-      <section className="section-title">联系人 · {personas.length}</section>
-      <div className="contacts">
-        {personas.map((p) => (
-          <div key={p.id} className="contact">
-            <Avatar name={p.name} color={p.color} />
-            <div className="room-main">
-              <div className="room-name">{p.name}</div>
-              <div className="room-last">{p.engine}</div>
-            </div>
-            <button className="link" onClick={async () => {
-              const room = await invoke<Room>("open_dm", { personaId: p.id });
-              onOpenRoom(room);
-            }}>私聊 →</button>
-          </div>
-        ))}
+    <div className="modal-mask" onClick={() => onClose(false)}>
+      <div className="wizard" onClick={(e) => e.stopPropagation()}>
+        <div className="logo">🐈‍⬛</div>
+        <h1>绑定你的本地 Agent</h1>
+        <p className="sub">检测到的 CLI 已自动勾选；未安装/未登录的可稍后补绑。</p>
+        <div className="engine-list">
+          {engines.map((e) => {
+            const path = doctor?.tools?.[e];
+            return (
+              <label key={e} className={`engine ${path ? "" : "disabled"}`}>
+                <input type="checkbox" checked={selected.has(e)} disabled={!path} onChange={() => toggle(e)} />
+                <span className="ename">{labels[e]}</span>
+                <span className="estat">{path ? "✅ 已检测" : "⬜ 未安装"}</span>
+              </label>
+            );
+          })}
+        </div>
+        <button className="primary" disabled={busy || selected.size === 0}
+          onClick={async () => { setBusy(true); await invoke("bind_personas", { engines: [...selected] }); onClose(true); }}>
+          {busy ? "绑定中…" : `绑定 ${selected.size} 个 Agent →`}
+        </button>
       </div>
     </div>
   );
 }
 
-/* ---------- 私聊对话框 ---------- */
+/* ---------- 聊天区 ---------- */
 
-function ChatView({ room, personas, onBack }:
-  { room: Room; personas: Persona[]; onBack: () => void }) {
+function ChatView({ room, personas, onSent }:
+  { room: Room; personas: Persona[]; onSent: () => void }) {
   const [history, setHistory] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -169,55 +246,102 @@ function ChatView({ room, personas, onBack }:
   const colorOf = (sender: string) =>
     sender === "user" ? "#0a84ff" : personas.find((p) => p.id === sender)?.color ?? "#8e8e93";
 
+  // client_msg_id：每次发送自铸，重试沿用 → UNIQUE(room_id, client_msg_id) 幂等（§4.11）
+  const pendingIdRef = useRef<string | null>(null);
   const send = async () => {
     const text = input.trim();
     if (!text || sending) return;
+    if (!pendingIdRef.current) pendingIdRef.current = mintClientMsgId();
     setInput(""); setSending(true);
     try {
-      const h = await invoke<Msg[]>("send_message", { roomId: room.id, text });
+      const h = await invoke<Msg[]>("send_message", { roomId: room.id, text, clientMsgId: pendingIdRef.current });
       setHistory(h);
+      pendingIdRef.current = null;
+      onSent();
+    } catch {
+      setInput(text); // 失败回填，重试沿用同一 client_msg_id
     } finally { setSending(false); }
   };
 
+  const firstPersona = room.members[0] ? personas.find((p) => p.id === room.members[0]) : undefined;
+
   return (
     <div className="chat">
-      <header className="topbar">
-        <button className="link" onClick={onBack}>← 返回</button>
-        <span className="brand">{room.name}</span>
-        <span className="perm">{room.permission}</span>
+      <header className="chat-head">
+        <div className="ch-name">{room.name}</div>
+        <div className="ch-status">
+          <span className="online-dot" /> 在线
+          <span className="perm-badge">{room.permission}</span>
+        </div>
       </header>
       <div className="bubbles">
-        {history.map((m) => (
-          <div key={m.id} className={`bubble-row ${m.role === "user" ? "me" : ""}`}>
-            {m.role !== "user" && <Avatar name={nameOf(m.sender)} color={colorOf(m.sender)} small />}
-            <div className={`bubble ${m.role === "user" ? "me" : ""}`}
-              style={m.role !== "user" ? { borderLeftColor: colorOf(m.sender) } : {}}>
-              <div className="bubble-head">
-                <span style={{ color: colorOf(m.sender) }}>{nameOf(m.sender)}</span>
-                <span className="meta">
-                  {m.tokens != null && `⛁ ${m.tokens.toLocaleString()} tok · `}
-                  {m.duration_s != null && `${Math.round(m.duration_s)}s · `}
-                  {m.status && m.status !== "success" && <b className="bad">{m.status}</b>}
-                  {m.created_at.slice(11, 19)}
-                </span>
+        {history.map((m, i) => {
+          const divider = needDivider(history[i - 1], m) ? (
+            <div key={`t-${m.id}`} className="time-divider">{fmtDivider(m.created_at)}</div>
+          ) : null;
+          return (
+            <div key={m.id}>
+              {divider}
+              <div className={`bubble-row ${m.role === "user" ? "me" : ""}`}>
+                {m.role !== "user" && <Avatar name={nameOf(m.sender)} color={colorOf(m.sender)} small />}
+                <div className={`bubble ${m.role === "user" ? "me" : ""}`}>
+                  {m.role !== "user" && (
+                    <div className="bubble-head">
+                      <span style={{ color: colorOf(m.sender) }}>{nameOf(m.sender)}</span>
+                      <span className="meta">
+                        {m.tokens != null && `⛁ ${m.tokens.toLocaleString()} tok · `}
+                        {m.duration_s != null && `${Math.round(m.duration_s)}s · `}
+                        {m.status && m.status !== "success" && <b className="bad">{m.status}</b>}
+                      </span>
+                    </div>
+                  )}
+                  <pre className="bubble-text">{m.text}</pre>
+                </div>
+                {m.role === "user" && <div className="avatar small me-avatar">H</div>}
               </div>
-              <pre className="bubble-text">{m.text}</pre>
             </div>
+          );
+        })}
+        {sending && (
+          <div className="bubble-row">
+            {firstPersona && <Avatar name={firstPersona.name} color={firstPersona.color} small />}
+            <div className="typing"><span /><span /><span /></div>
           </div>
-        ))}
-        {sending && <div className="typing">对方正在输入…</div>}
+        )}
         <div ref={bottomRef} />
       </div>
       <div className="composer">
-        <textarea value={input} rows={2} placeholder="发消息…（Enter 发送，Shift+Enter 换行）"
+        <div className="composer-tools">
+          <button className="tool" title="快捷指令（即将上线）" disabled>⚡</button>
+          <button className="tool" title="图片/文件（即将上线）" disabled>📎</button>
+        </div>
+        <textarea value={input} rows={2} placeholder={`发送给 ${room.name}（Enter 发送，Shift+Enter 换行）`}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
-        <button className="primary" disabled={sending || !input.trim()} onClick={send}>
-          {sending ? "…" : "发送"}
-        </button>
+        <button className="send" disabled={sending || !input.trim()} onClick={send}>➤</button>
       </div>
     </div>
   );
+}
+
+function needDivider(prev: Msg | undefined, cur: Msg): boolean {
+  if (!prev) return true;
+  const gap = new Date(cur.created_at).getTime() - new Date(prev.created_at).getTime();
+  return gap > 5 * 60 * 1000;
+}
+function fmtDivider(at: string): string {
+  const d = new Date(at);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+function mintClientMsgId(): string {
+  // msg-<ulid 风格>：时间有序 + 随机，26 字符 Crockford base32（与后端 §4.11 同形）
+  const CROCK = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  const rand = crypto.getRandomValues(new Uint8Array(10));
+  let v = (BigInt(Date.now()) & 0xffffffffffffn) << 80n;
+  rand.forEach((b, i) => { v |= BigInt(b) << BigInt((9 - i) * 8); });
+  let s = "";
+  for (let i = 0; i < 26; i++) s += CROCK[Number((v >> BigInt(125 - 5 * i)) & 31n)];
+  return `msg-${s}`;
 }
 
 function Avatar({ name, color, group, small }:
