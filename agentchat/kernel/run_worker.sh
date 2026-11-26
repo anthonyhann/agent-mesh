@@ -232,7 +232,7 @@ DURATION=$((END_TS - START_TS))
 # criteria 只对 content 匹配，防止 thinking 模型的 reasoning_content 造成假阳性。
 STATUS=$(TASK_FILE="$TASK_FILE" OUT_DIR="$OUT_DIR" T_ID="$T_ID" T_WORKER="$T_WORKER" T_BRIEF="$T_BRIEF" \
 EXIT_CODE="$EXIT_CODE" DURATION="$DURATION" ATTEMPTS="$ATTEMPTS" \
-START_ISO="$START_ISO" END_ISO="$END_ISO" T_REGEX="$T_REGEX" \
+START_ISO="$START_ISO" END_ISO="$END_ISO" T_REGEX="$T_REGEX" T_SESSION="$T_SESSION" \
 python3 - <<'PYEOF'
 import json, os, re
 out = os.environ["OUT_DIR"]
@@ -465,6 +465,10 @@ if regex:
     criteria = {"stdout_regex": regex, "passed": passed, "target": target_kind}
     if status == "success" and not passed:
         status = "criteria_failed"
+
+# 续聊兜底：任务卡显式携带 session_id 时，本轮会话权威即该 id（dsh 续接不改 session 目录 mtime，启发式会丢）
+if not session_id:
+    session_id = os.environ.get("T_SESSION") or None
 
 result = {
     "task_id": os.environ["T_ID"],

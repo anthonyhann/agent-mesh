@@ -1,11 +1,15 @@
 //! AgentChat SQLite 层（§4.3 会话事实源）
 //! DB 位于 MESH_DATA 顶层 agentchat.db；results/ 仅为不可变 artifact 仓库。
+//! Schema 版本化（§4.10）：PRAGMA user_version；v0=M1 旧库 → v1=v2.4 schema。
 
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::path::Path;
 
 pub struct Db(pub Connection);
+
+/// 当前 schema 版本（§4.10：v0=M1 旧库 → v1=v2.4）
+pub const SCHEMA_VERSION: i64 = 1;
 
 /// 8 个 engine 注册表：(engine, 显示名, 主题色)
 pub const ENGINES: [(&str, &str, &str); 8] = [
@@ -61,39 +65,322 @@ pub fn uuid8() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-impl Db {
-    pub fn open(path: &Path) -> Result<Self, String> {
-        let conn = Connection::open(path).map_err(|e| format!("open db: {e}"))?;
-        conn.execute_batch(
-            "
-PRAGMA journal_mode=WAL;
+/// ULID（§4.11：client_msg_id = msg-<ulid>）：48bit 毫秒时间 + 80bit 随机，Crockford base32
+pub fn ulid() -> String {
+    const CROCK: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
+    unsafe { libc::gettimeofday(&mut tv, std::ptr::null_mut()) };
+    let ms = (tv.tv_sec as u128) * 1000 + (tv.tv_usec as u128) / 1000;
+    let mut rand = [0u8; 10];
+    unsafe {
+        libc::arc4random_buf(rand.as_mut_ptr() as *mut _, 10);
+    }
+    let lo: u128 = rand.iter().fold(0u128, |a, &b| (a << 8) | b as u128);
+    let v: u128 = ((ms & 0xFFFF_FFFF_FFFF) << 80) | lo;
+    (0..26)
+        .map(|i| CROCK[((v >> (125 - 5 * i)) & 31) as usize] as char)
+        .collect()
+}
+
+/// v1 全量 schema（新库直接建；老库经迁移殊途同归）
+const SCHEMA_V1: &str = "
 CREATE TABLE IF NOT EXISTS personas(
   id TEXT PRIMARY KEY, engine TEXT NOT NULL, name TEXT NOT NULL,
-  color TEXT NOT NULL, bound INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+  color TEXT NOT NULL, bound INTEGER NOT NULL DEFAULT 1, behavior_md TEXT,
+  created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS rooms(
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
   members TEXT NOT NULL, cwd TEXT NOT NULL, permission TEXT NOT NULL DEFAULT 'project',
   default_target TEXT NOT NULL DEFAULT 'last', max_auto_turns INTEGER NOT NULL DEFAULT 6,
-  dm_settings TEXT, created_at TEXT NOT NULL);
+  dm_settings TEXT,
+  reply_mode TEXT NOT NULL DEFAULT 'all', default_target_persona_id TEXT,
+  owner_persona_id TEXT, batch_delay_s INTEGER NOT NULL DEFAULT 10,
+  auto_turn_limit INTEGER NOT NULL DEFAULT 3, group_prompt TEXT,
+  chain_react INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS room_members(
+  room_id TEXT NOT NULL, persona_id TEXT NOT NULL,
+  muted INTEGER NOT NULL DEFAULT 0, reply_mode TEXT,
+  PRIMARY KEY(room_id, persona_id));
 CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT, room_id TEXT NOT NULL, sender TEXT NOT NULL,
-  role TEXT NOT NULL, text TEXT NOT NULL, run_id TEXT, reply_to INTEGER, created_at TEXT NOT NULL);
+  role TEXT NOT NULL, text TEXT NOT NULL, turn_id TEXT, reply_to INTEGER,
+  client_msg_id TEXT, recalled INTEGER NOT NULL DEFAULT 0, legacy_run_id TEXT,
+  created_at TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_client ON messages(room_id, client_msg_id);
 CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_id, id);
+CREATE TABLE IF NOT EXISTS turns(
+  turn_id TEXT PRIMARY KEY, room_id TEXT NOT NULL, trigger_msg_ids TEXT NOT NULL,
+  target_personas TEXT NOT NULL, status TEXT NOT NULL, lane_seq INTEGER,
+  claimed_at TEXT, lease_until TEXT, attempt INTEGER NOT NULL DEFAULT 1,
+  parent_turn_id TEXT, created_at TEXT NOT NULL, completed_at TEXT,
+  cancel_reason TEXT, last_error TEXT);
+CREATE INDEX IF NOT EXISTS idx_turns_room ON turns(room_id, lane_seq);
 CREATE TABLE IF NOT EXISTS runs(
   id TEXT PRIMARY KEY, room_id TEXT, persona_id TEXT, task_json TEXT NOT NULL,
   status TEXT, session_id TEXT, tokens INTEGER, duration_s REAL, synthesized INTEGER DEFAULT 0,
-  answer_text TEXT, created_at TEXT NOT NULL, finished_at TEXT);
+  answer_text TEXT, turn_id TEXT, attempt INTEGER NOT NULL DEFAULT 1, grants TEXT,
+  created_at TEXT NOT NULL, finished_at TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_runs_turn ON runs(turn_id, persona_id, attempt) WHERE turn_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_runs_room ON runs(room_id, persona_id, finished_at);
+CREATE TABLE IF NOT EXISTS room_persona_sessions(
+  room_id TEXT NOT NULL, persona_id TEXT NOT NULL,
+  session_id TEXT, sandbox TEXT, status TEXT, archived TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(room_id, persona_id));
+CREATE TABLE IF NOT EXISTS room_summaries(
+  room_id TEXT PRIMARY KEY, summary_text TEXT, summary_through_msg_id INTEGER,
+  summary_tokens INTEGER, model TEXT, prompt_version TEXT, summary_error TEXT,
+  version INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS approvals(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT, tool_name TEXT, args_hash TEXT,
+  grant_expires_at TEXT, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS run_nodes(
   id TEXT PRIMARY KEY, run_id TEXT NOT NULL, node_seq INTEGER, persona_id TEXT,
   depends_on TEXT, status TEXT, winner INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS scores(
   id INTEGER PRIMARY KEY AUTOINCREMENT, persona_id TEXT NOT NULL, room_id TEXT,
   event TEXT NOT NULL, delta INTEGER NOT NULL, detail TEXT, created_at TEXT NOT NULL);
-",
-        )
-        .map_err(|e| format!("migrate: {e}"))?;
+";
+
+impl Db {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("mkdir db dir: {e}"))?;
+        }
+        let conn = Connection::open(path).map_err(|e| format!("open db: {e}"))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .map_err(|e| format!("wal: {e}"))?;
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .map_err(|e| format!("user_version: {e}"))?;
+        match version.cmp(&SCHEMA_VERSION) {
+            std::cmp::Ordering::Greater => {
+                return Err(format!(
+                    "db schema v{version} 比 app 支持的 v{SCHEMA_VERSION} 新，请升级 AgentChat"
+                ))
+            }
+            std::cmp::Ordering::Equal => {
+                // 幂等兜底：老版本 app 建的 v1 可能缺后续幂等对象
+                conn.execute_batch(SCHEMA_V1).map_err(|e| format!("schema v1: {e}"))?;
+            }
+            std::cmp::Ordering::Less => {
+                let fresh: bool = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .map_err(|e| e.to_string())?
+                    == 0;
+                if fresh {
+                    conn.execute_batch(SCHEMA_V1).map_err(|e| format!("schema v1: {e}"))?;
+                    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+                        .map_err(|e| format!("user_version set: {e}"))?;
+                } else {
+                    // v0（M1 旧库）→ v1：先备份再迁移（§4.10 定型顺序）
+                    let db = Self(conn);
+                    let backup = db.backup_for_migration(path)?;
+                    if let Err(e) = db.migrate_v0_to_v1() {
+                        return Err(format!(
+                            "schema 迁移失败（已回滚，备份在 {}）：{e}",
+                            backup.display()
+                        ));
+                    }
+                    return Ok(db);
+                }
+            }
+        }
         Ok(Self(conn))
+    }
+
+    /// 迁移前备份：VACUUM INTO（事务外，WAL 安全）→ backups/ 0700，只留最近 5 份
+    fn backup_for_migration(&self, db_path: &Path) -> Result<std::path::PathBuf, String> {
+        let dir = db_path
+            .parent()
+            .ok_or("db path has no parent")?
+            .join("backups");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir backups: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("chmod backups: {e}"))?;
+        }
+        let stamp = now().replace(['-', ':'], "");
+        let mut dest = None;
+        for _ in 0..10 {
+            // 预检不存在，生成带时间戳的唯一备份文件名
+            let candidate = dir.join(format!("agentchat-{stamp}-{}.db", &uuid8()[..4]));
+            if !candidate.exists() {
+                dest = Some(candidate);
+                break;
+            }
+        }
+        let dest = dest.ok_or("无法生成唯一备份文件名")?;
+        let escaped = dest.display().to_string().replace('\'', "''");
+        self.0
+            .execute_batch(&format!("VACUUM INTO '{escaped}'"))
+            .map_err(|e| format!("VACUUM INTO: {e}"))?;
+        // 只保留最近 5 份
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .map_err(|e| e.to_string())?
+            .filter_map(|e| e.ok().map(|x| x.path()))
+            .filter(|p| p.extension().map(|x| x == "db").unwrap_or(false))
+            .collect();
+        files.sort();
+        while files.len() > 5 {
+            let victim = files.remove(0);
+            let _ = std::fs::remove_file(victim);
+        }
+        Ok(dest)
+    }
+
+    /// v0 → v1 迁移事务：任何一步失败整体回滚（备份已在事务外完成）
+    fn migrate_v0_to_v1(&self) -> Result<(), String> {
+        let tx = self.0.unchecked_transaction().map_err(|e| e.to_string())?;
+
+        // —— personas：+behavior_md ——
+        add_column_if_missing(&tx, "personas", "behavior_md", "behavior_md TEXT")?;
+
+        // —— rooms：+v2.4 房间字段 ——
+        for (col, ddl) in [
+            ("reply_mode", "reply_mode TEXT NOT NULL DEFAULT 'all'"),
+            ("default_target_persona_id", "default_target_persona_id TEXT"),
+            ("owner_persona_id", "owner_persona_id TEXT"),
+            ("batch_delay_s", "batch_delay_s INTEGER NOT NULL DEFAULT 10"),
+            ("auto_turn_limit", "auto_turn_limit INTEGER NOT NULL DEFAULT 3"),
+            ("group_prompt", "group_prompt TEXT"),
+            ("chain_react", "chain_react INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            add_column_if_missing(&tx, "rooms", col, ddl)?;
+        }
+        // 轮数闸门合一：旧 max_auto_turns 值迁入 auto_turn_limit
+        tx.execute(
+            "UPDATE rooms SET auto_turn_limit=max_auto_turns WHERE auto_turn_limit=3 AND max_auto_turns<>6",
+            [],
+        )
+        .map_err(|e| format!("rooms backfill auto_turn_limit: {e}"))?;
+
+        // —— room_members：members JSON → 表行；owner_persona_id=首个成员 ——
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS room_members(
+              room_id TEXT NOT NULL, persona_id TEXT NOT NULL,
+              muted INTEGER NOT NULL DEFAULT 0, reply_mode TEXT,
+              PRIMARY KEY(room_id, persona_id));",
+        )
+        .map_err(|e| format!("create room_members: {e}"))?;
+        {
+            let mut st = tx
+                .prepare("SELECT id, members FROM rooms")
+                .map_err(|e| e.to_string())?;
+            let rows: Vec<(String, String)> = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| e.to_string())?
+                .filter_map(|x| x.ok())
+                .collect();
+            drop(st);
+            for (room_id, members_json) in rows {
+                let members: Vec<String> = serde_json::from_str(&members_json).unwrap_or_default();
+                for (i, pid) in members.iter().enumerate() {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO room_members(room_id,persona_id) VALUES(?1,?2)",
+                        params![room_id, pid],
+                    )
+                    .map_err(|e| format!("room_members backfill: {e}"))?;
+                    if i == 0 {
+                        tx.execute(
+                            "UPDATE rooms SET owner_persona_id=?2 WHERE id=?1 AND owner_persona_id IS NULL",
+                            params![room_id, pid],
+                        )
+                        .map_err(|e| format!("owner_persona_id backfill: {e}"))?;
+                    }
+                }
+            }
+        }
+
+        // —— 测试钩子：注入迁移中途失败（验收回滚+备份恢复路径）——
+        if std::env::var("AGENTCHAT_MIGRATE_FAIL_AFTER").as_deref() == Ok("rooms") {
+            return Err("injected migration failure after rooms".into());
+        }
+
+        // —— messages 重建：保留原 id、backfill client_msg_id、run_id→legacy_run_id ——
+        tx.execute_batch(
+            "CREATE TABLE messages_new(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, room_id TEXT NOT NULL, sender TEXT NOT NULL,
+              role TEXT NOT NULL, text TEXT NOT NULL, turn_id TEXT, reply_to INTEGER,
+              client_msg_id TEXT, recalled INTEGER NOT NULL DEFAULT 0, legacy_run_id TEXT,
+              created_at TEXT NOT NULL);
+            INSERT INTO messages_new(id,room_id,sender,role,text,turn_id,reply_to,client_msg_id,recalled,legacy_run_id,created_at)
+              SELECT id,room_id,sender,role,text,NULL,reply_to,'msg-legacy-'||id,0,run_id,created_at FROM messages;
+            DROP TABLE messages;
+            ALTER TABLE messages_new RENAME TO messages;
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_client ON messages(room_id, client_msg_id);
+            CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_id, id);
+            UPDATE sqlite_sequence SET seq=(SELECT COALESCE(MAX(id),0) FROM messages) WHERE name='messages';",
+        )
+        .map_err(|e| format!("messages rebuild: {e}"))?;
+
+        // —— turns：房间回合持久化（M2a-2 启用，先建表）——
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS turns(
+              turn_id TEXT PRIMARY KEY, room_id TEXT NOT NULL, trigger_msg_ids TEXT NOT NULL,
+              target_personas TEXT NOT NULL, status TEXT NOT NULL, lane_seq INTEGER,
+              claimed_at TEXT, lease_until TEXT, attempt INTEGER NOT NULL DEFAULT 1,
+              parent_turn_id TEXT, created_at TEXT NOT NULL, completed_at TEXT,
+              cancel_reason TEXT, last_error TEXT);
+            CREATE INDEX IF NOT EXISTS idx_turns_room ON turns(room_id, lane_seq);",
+        )
+        .map_err(|e| format!("create turns: {e}"))?;
+
+        // —— runs：+turn_id/attempt/grants 快照 + 部分唯一索引 ——
+        for (col, ddl) in [
+            ("turn_id", "turn_id TEXT"),
+            ("attempt", "attempt INTEGER NOT NULL DEFAULT 1"),
+            ("grants", "grants TEXT"),
+        ] {
+            add_column_if_missing(&tx, "runs", col, ddl)?;
+        }
+        tx.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_runs_turn ON runs(turn_id, persona_id, attempt) WHERE turn_id IS NOT NULL;",
+        )
+        .map_err(|e| format!("runs unique index: {e}"))?;
+
+        // —— room_persona_sessions：从最近成功 run backfill（K3 权威表）——
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS room_persona_sessions(
+              room_id TEXT NOT NULL, persona_id TEXT NOT NULL,
+              session_id TEXT, sandbox TEXT, status TEXT, archived TEXT,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY(room_id, persona_id));",
+        )
+        .map_err(|e| format!("create room_persona_sessions: {e}"))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO room_persona_sessions(room_id,persona_id,session_id,status,created_at)
+             SELECT room_id, persona_id, session_id, 'active', MAX(finished_at)
+             FROM runs
+             WHERE session_id IS NOT NULL AND status='success' AND room_id IS NOT NULL AND persona_id IS NOT NULL
+             GROUP BY room_id, persona_id",
+            [],
+        )
+        .map_err(|e| format!("room_persona_sessions backfill: {e}"))?;
+
+        // —— room_summaries / approvals（P2 预留）——
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS room_summaries(
+              room_id TEXT PRIMARY KEY, summary_text TEXT, summary_through_msg_id INTEGER,
+              summary_tokens INTEGER, model TEXT, prompt_version TEXT, summary_error TEXT,
+              version INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS approvals(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT, tool_name TEXT, args_hash TEXT,
+              grant_expires_at TEXT, created_at TEXT NOT NULL);",
+        )
+        .map_err(|e| format!("create summaries/approvals: {e}"))?;
+
+        tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+            .map_err(|e| format!("user_version set: {e}"))?;
+        tx.commit().map_err(|e| format!("migrate commit: {e}"))?;
+        Ok(())
     }
 
     /// 绑定向导：为勾选的 engine 各建一个 persona（幂等：已绑定跳过）
@@ -160,8 +447,8 @@ CREATE TABLE IF NOT EXISTS scores(
         if let Some(id) = self
             .0
             .query_row(
-                "SELECT id FROM rooms WHERE kind='dm' AND members=?1",
-                params![format!("[\"{persona_id}\"]")],
+                "SELECT room_id FROM room_members WHERE persona_id=?1 AND room_id IN (SELECT id FROM rooms WHERE kind='dm') LIMIT 1",
+                params![persona_id],
                 |r| r.get::<_, String>(0),
             )
             .ok()
@@ -179,15 +466,22 @@ CREATE TABLE IF NOT EXISTS scores(
         let id = format!("r-{}", uuid8());
         self.0
             .execute(
-                "INSERT INTO rooms(id,kind,name,members,cwd,permission,default_target,max_auto_turns,created_at)
-                 VALUES(?1,'dm',?2,?3,?4,'project','last',6,?5)",
+                "INSERT INTO rooms(id,kind,name,members,cwd,permission,default_target,max_auto_turns,owner_persona_id,created_at)
+                 VALUES(?1,'dm',?2,?3,?4,'project','last',6,?5,?6)",
                 params![
                     id,
                     name,
                     format!("[\"{persona_id}\"]"),
                     cwd.display().to_string(),
+                    persona_id,
                     now()
                 ],
+            )
+            .map_err(|e| e.to_string())?;
+        self.0
+            .execute(
+                "INSERT OR IGNORE INTO room_members(room_id,persona_id) VALUES(?1,?2)",
+                params![id, persona_id],
             )
             .map_err(|e| e.to_string())?;
         self.get_room(&id)
@@ -196,18 +490,45 @@ CREATE TABLE IF NOT EXISTS scores(
     pub fn get_room(&self, id: &str) -> Result<Value, String> {
         self.0
             .query_row(
-                "SELECT id,kind,name,members,cwd,permission,default_target,max_auto_turns FROM rooms WHERE id=?1",
+                "SELECT id,kind,name,cwd,permission,reply_mode,default_target_persona_id,owner_persona_id,
+                        batch_delay_s,auto_turn_limit,chain_react
+                 FROM rooms WHERE id=?1",
                 params![id],
                 |r| {
                     Ok(json!({
                         "id": r.get::<_,String>(0)?, "kind": r.get::<_,String>(1)?,
                         "name": r.get::<_,String>(2)?,
-                        "members": serde_json::from_str::<Value>(&r.get::<_,String>(3)?).unwrap_or(json!([])),
-                        "cwd": r.get::<_,String>(4)?, "permission": r.get::<_,String>(5)?,
-                        "default_target": r.get::<_,String>(6)?, "max_auto_turns": r.get::<_,i64>(7)?,
+                        "cwd": r.get::<_,String>(3)?, "permission": r.get::<_,String>(4)?,
+                        "reply_mode": r.get::<_,String>(5)?,
+                        "default_target_persona_id": r.get::<_,Option<String>>(6)?,
+                        "owner_persona_id": r.get::<_,Option<String>>(7)?,
+                        "batch_delay_s": r.get::<_,i64>(8)?, "auto_turn_limit": r.get::<_,i64>(9)?,
+                        "chain_react": r.get::<_,i64>(10)? == 1,
                     }))
                 },
             )
+            .and_then(|mut room| {
+                // members 权威源 = room_members 表（迁移已 backfill）
+                let mut st = self.0.prepare(
+                    "SELECT persona_id FROM room_members WHERE room_id=?1 ORDER BY rowid",
+                )?;
+                let members: Vec<String> = st
+                    .query_map(params![id], |r| r.get(0))?
+                    .filter_map(|x| x.ok())
+                    .collect();
+                if members.is_empty() {
+                    // 极端兜底：老库未迁移（不应发生）
+                    let legacy: String = self.0.query_row(
+                        "SELECT members FROM rooms WHERE id=?1",
+                        params![id],
+                        |r| r.get(0),
+                    )?;
+                    room["members"] = serde_json::from_str(&legacy).unwrap_or(json!([]));
+                } else {
+                    room["members"] = json!(members);
+                }
+                Ok(room)
+            })
             .map_err(|e| e.to_string())
     }
 
@@ -239,30 +560,52 @@ CREATE TABLE IF NOT EXISTS scores(
         Ok(Value::Array(out))
     }
 
+    /// 写入消息：client_msg_id 由本层自铸（§4.11 msg-<ulid>），
+    /// UNIQUE(room_id, client_msg_id) 幂等——重复提交返回既有消息 id。
+    /// turn_id / legacy_run_id 二选一携带（M2a-2 前气泡走 legacy_run_id 关联）。
     pub fn add_message(
         &self,
         room_id: &str,
         sender: &str,
         role: &str,
         text: &str,
-        run_id: Option<&str>,
-    ) -> Result<i64, String> {
+        turn_id: Option<&str>,
+        legacy_run_id: Option<&str>,
+    ) -> Result<(i64, String), String> {
+        let client_msg_id = format!("msg-{}", ulid());
         self.0
             .execute(
-                "INSERT INTO messages(room_id,sender,role,text,run_id,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
-                params![room_id, sender, role, text, run_id, now()],
+                "INSERT INTO messages(room_id,sender,role,text,turn_id,client_msg_id,legacy_run_id,created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+                 ON CONFLICT(room_id, client_msg_id) DO NOTHING",
+                params![room_id, sender, role, text, turn_id, client_msg_id, legacy_run_id, now()],
             )
             .map_err(|e| e.to_string())?;
-        Ok(self.0.last_insert_rowid())
+        let id: i64 = self
+            .0
+            .query_row(
+                "SELECT id FROM messages WHERE room_id=?1 AND client_msg_id=?2",
+                params![room_id, client_msg_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok((id, client_msg_id))
     }
 
+    /// 历史（§4.3 join 规则）：persona 消息按 (turn_id, sender) 取最新 attempt；
+    /// turn_id 为空（迁移旧数据 / M2a-2 前过渡期）回退 legacy_run_id；user 消息不 join。
     pub fn room_history(&self, room_id: &str, limit: i64) -> Result<Value, String> {
         let mut st = self
             .0
             .prepare(
-                "SELECT m.id,m.sender,m.role,m.text,m.run_id,m.created_at,
+                "SELECT m.id,m.sender,m.role,m.text,m.turn_id,m.legacy_run_id,m.client_msg_id,m.created_at,
                         r.status,r.tokens,r.duration_s,r.session_id
-                 FROM messages m LEFT JOIN runs r ON m.run_id=r.id
+                 FROM messages m
+                 LEFT JOIN runs r ON (
+                   (m.turn_id IS NOT NULL AND r.turn_id=m.turn_id AND r.persona_id=m.sender
+                     AND r.attempt=(SELECT MAX(attempt) FROM runs WHERE turn_id=m.turn_id AND persona_id=m.sender))
+                   OR (m.turn_id IS NULL AND m.legacy_run_id IS NOT NULL AND r.id=m.legacy_run_id)
+                 )
                  WHERE m.room_id=?1 ORDER BY m.id DESC LIMIT ?2",
             )
             .map_err(|e| e.to_string())?;
@@ -271,9 +614,11 @@ CREATE TABLE IF NOT EXISTS scores(
                 Ok(json!({
                     "id": r.get::<_,i64>(0)?, "sender": r.get::<_,String>(1)?,
                     "role": r.get::<_,String>(2)?, "text": r.get::<_,String>(3)?,
-                    "run_id": r.get::<_,Option<String>>(4)?, "created_at": r.get::<_,String>(5)?,
-                    "status": r.get::<_,Option<String>>(6)?, "tokens": r.get::<_,Option<i64>>(7)?,
-                    "duration_s": r.get::<_,Option<f64>>(8)?, "session_id": r.get::<_,Option<String>>(9)?,
+                    "turn_id": r.get::<_,Option<String>>(4)?,
+                    "run_id": r.get::<_,Option<String>>(5)?,
+                    "client_msg_id": r.get::<_,Option<String>>(6)?, "created_at": r.get::<_,String>(7)?,
+                    "status": r.get::<_,Option<String>>(8)?, "tokens": r.get::<_,Option<i64>>(9)?,
+                    "duration_s": r.get::<_,Option<f64>>(10)?, "session_id": r.get::<_,Option<String>>(11)?,
                 }))
             })
             .map_err(|e| e.to_string())?
@@ -282,24 +627,33 @@ CREATE TABLE IF NOT EXISTS scores(
         Ok(Value::Array(rows.into_iter().rev().collect()))
     }
 
-    /// 续聊：房间内该 persona 最近一次成功的 session_id（§4.4 完成协议）
+    /// 续聊（§4.3 K3：权威表 room_persona_sessions，不回读 runs.task_json）
     pub fn last_session(&self, room_id: &str, persona_id: &str) -> Option<String> {
         self.0
             .query_row(
-                "SELECT session_id FROM runs WHERE room_id=?1 AND persona_id=?2
-                 AND session_id IS NOT NULL AND status='success'
-                 ORDER BY finished_at DESC, rowid DESC LIMIT 1",
+                "SELECT session_id FROM room_persona_sessions
+                 WHERE room_id=?1 AND persona_id=?2 AND session_id IS NOT NULL AND status='active'",
                 params![room_id, persona_id],
                 |r| r.get(0),
             )
             .ok()
     }
 
-    pub fn add_run(&self, run: &Value, room_id: &str, persona_id: &str, task_json: &str) -> Result<(), String> {
+    /// 落 run（§4.3：UNIQUE(turn_id, persona_id, attempt)；M2a-2 前 turn_id 可空走 INSERT OR REPLACE by id）。
+    /// 成功且带 session_id 时维护 room_persona_sessions：换 session 旧值进 archived JSON（可审计）。
+    pub fn add_run(
+        &self,
+        run: &Value,
+        room_id: &str,
+        persona_id: &str,
+        task_json: &str,
+        turn_id: Option<&str>,
+        attempt: i64,
+    ) -> Result<(), String> {
         self.0
             .execute(
-                "INSERT OR REPLACE INTO runs(id,room_id,persona_id,task_json,status,session_id,tokens,duration_s,synthesized,answer_text,created_at,finished_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                "INSERT OR REPLACE INTO runs(id,room_id,persona_id,task_json,status,session_id,tokens,duration_s,synthesized,answer_text,turn_id,attempt,created_at,finished_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 params![
                     run["task_id"].as_str().unwrap_or(""),
                     room_id,
@@ -311,11 +665,72 @@ CREATE TABLE IF NOT EXISTS scores(
                     run["duration_s"].as_f64(),
                     if run["synthesized"].as_bool().unwrap_or(false) { 1 } else { 0 },
                     run["answer_text"].as_str().unwrap_or(""),
+                    turn_id,
+                    attempt,
                     run["started_at"].as_str().map(String::from).unwrap_or_else(now),
                     run["finished_at"].as_str().map(String::from).unwrap_or_else(now),
                 ],
             )
             .map_err(|e| e.to_string())?;
+        if run["status"].as_str() == Some("success") {
+            if let Some(session_id) = run["session_id"].as_str() {
+                let existing: Option<(String, String)> = self
+                    .0
+                    .query_row(
+                        "SELECT session_id, COALESCE(archived,'[]') FROM room_persona_sessions
+                         WHERE room_id=?1 AND persona_id=?2",
+                        params![room_id, persona_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .ok();
+                match existing {
+                    Some((old, archived)) if old != session_id => {
+                        // 更换 session：旧值写入 archived（不静默替换，可审计）
+                        let mut arr: Vec<Value> =
+                            serde_json::from_str(&archived).unwrap_or_default();
+                        arr.push(json!({"session_id": old, "replaced_at": now()}));
+                        self.0
+                            .execute(
+                                "UPDATE room_persona_sessions SET session_id=?3, archived=?4, status='active'
+                                 WHERE room_id=?1 AND persona_id=?2",
+                                params![room_id, persona_id, session_id, serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())],
+                            )
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.0
+                            .execute(
+                                "INSERT INTO room_persona_sessions(room_id,persona_id,session_id,status,created_at)
+                                 VALUES(?1,?2,?3,'active',?4)",
+                                params![room_id, persona_id, session_id, now()],
+                            )
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+        }
         Ok(())
     }
+}
+
+/// ALTER TABLE ADD COLUMN（幂等：列已存在则跳过）
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    ddl: &str,
+) -> Result<(), String> {
+    let exists: bool = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| e.to_string())?
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .filter_map(|x| x.ok())
+        .any(|name| name == column);
+    if !exists {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"))
+            .map_err(|e| format!("alter {table} add {column}: {e}"))?;
+    }
+    Ok(())
 }

@@ -363,11 +363,11 @@ fn send_message_core(db: &Db, state: &AppState, room_id: &str, text: &str) -> Re
     let persona = db.get_persona(&pid)?;
     let engine = persona["engine"].as_str().unwrap_or("").to_string();
     let cwd = room["cwd"].as_str().unwrap_or("").to_string();
-    let session = db.last_session(room_id, &pid);
-    db.add_message(room_id, "user", "user", text, None)?;
+let session = db.last_session(room_id, &pid);
+db.add_message(room_id, "user", "user", text, None, None)?;
 
-    // 2) 任务卡（§4.1；session 续接；codex 安全模式字段预置，K3 落地后生效）
-    let run_id = format!("msg-{}", db::uuid8());
+// 2) 任务卡（§4.1；session 续接；codex 安全模式字段预置，K3 落地后生效）
+let run_id = format!("run-{}", db::uuid8());
     let mut task = json!({
         "id": run_id, "worker": engine, "workspace": cwd,
         "timeout_seconds": 300, "brief": text,
@@ -379,9 +379,10 @@ fn send_message_core(db: &Db, state: &AppState, room_id: &str, text: &str) -> Re
         task["sandbox"] = Value::from("read-only");
     }
 
-    // 3) 执行 + 落库（本地 Connection 跨 run 无妨，其他命令用自己的连接）
-    let result = run_task_impl(task.clone(), state)?;
-    db.add_run(&result, room_id, &pid, &task.to_string())?;
+// 3) 执行 + 落库（本地 Connection 跨 run 无妨，其他命令用自己的连接）
+let result = run_task_impl(task.clone(), state)?;
+// M2a-2 lane 落地前 turn_id 为空，气泡经 legacy_run_id 关联 run（§4.3 join 规则）
+db.add_run(&result, room_id, &pid, &task.to_string(), None, 1)?;
     let status = result["status"].as_str().unwrap_or("failed");
     let answer = result["answer_text"].as_str().unwrap_or("").to_string();
     let bubble = if answer.is_empty() {
@@ -389,8 +390,8 @@ fn send_message_core(db: &Db, state: &AppState, room_id: &str, text: &str) -> Re
     } else {
         answer
     };
-    db.add_message(room_id, &pid, "persona", &bubble, Some(&run_id))?;
-    db.room_history(room_id, 200)
+db.add_message(room_id, &pid, "persona", &bubble, None, Some(&run_id))?;
+db.room_history(room_id, 200)
 }
 
 // ---------- 无头自检（M0 验收：模拟 launchd 环境跑 doctor + 假 worker） ----------
@@ -418,6 +419,11 @@ fn selftest() -> i32 {
     // M1 聊天闭环验收：AGENTCHAT_SELFTEST=chat 用真 dsh 跑两轮对话
     if std::env::var("AGENTCHAT_SELFTEST").as_deref() == Ok("chat") {
         return selftest_chat(&state);
+    }
+
+    // M2a-1 schema 迁移验收：AGENTCHAT_SELFTEST=migrate（可用 AGENTCHAT_MIGRATE_FIXTURE 指定真 M1 库副本）
+    if std::env::var("AGENTCHAT_SELFTEST").as_deref() == Ok("migrate") {
+        return selftest_migrate();
     }
 
     // 假 worker 一轮（fake-bin/dsh 须在 PATH 前置目录中）
@@ -589,4 +595,252 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// M2a-1 验收：v0 旧库 → v1 迁移全路径
+/// 1) 正向：fixture（或 AGENTCHAT_MIGRATE_FIXTURE 指定的真 M1 库副本）迁移成功，数据/会话/气泡不丢
+/// 2) 逆向：注入中途失败 → 报错且提示备份 → 从备份恢复 → 重开迁移成功
+fn selftest_migrate() -> i32 {
+    let fail = |msg: &str| {
+        eprintln!("[selftest-migrate] FAIL: {msg}");
+        1
+    };
+    let dir = std::env::temp_dir().join(format!("agentchat-migrate-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        return fail(&format!("mkdir: {e}"));
+    }
+    let db_path = dir.join("agentchat.db");
+
+    // —— 造 v0 fixture（或复制真实 M1 库）——
+    if let Ok(src) = std::env::var("AGENTCHAT_MIGRATE_FIXTURE") {
+        if let Err(e) = fs::copy(&src, &db_path) {
+            return fail(&format!("copy fixture {src}: {e}"));
+        }
+        println!("[selftest-migrate] fixture = real M1 db copy ({src})");
+    } else if let Err(e) = build_v0_fixture(&db_path) {
+        return fail(&format!("build fixture: {e}"));
+    }
+
+    // —— 正向迁移 ——
+    let db = match Db::open(&db_path) {
+        Ok(d) => d,
+        Err(e) => return fail(&format!("migrate: {e}")),
+    };
+    if let Err(e) = verify_migrated(&db, &db_path) {
+        return fail(&e);
+    }
+    println!("[selftest-migrate] forward migration OK");
+    drop(db);
+
+    // —— 逆向：注入失败 → 回滚 → 备份恢复 → 重迁 ——
+    let _ = fs::remove_file(&db_path);
+    let _ = fs::remove_file(dir.join("agentchat.db-wal"));
+    let _ = fs::remove_file(dir.join("agentchat.db-shm"));
+    if let Ok(src) = std::env::var("AGENTCHAT_MIGRATE_FIXTURE") {
+        let _ = fs::copy(&src, &db_path);
+    } else if let Err(e) = build_v0_fixture(&db_path) {
+        return fail(&format!("rebuild fixture: {e}"));
+    }
+    // 自测进程单线程，env 注入安全
+    unsafe { std::env::set_var("AGENTCHAT_MIGRATE_FAIL_AFTER", "rooms") };
+    let injected = match Db::open(&db_path) {
+        Ok(_) => return fail("注入失败却迁移成功"),
+        Err(e) => e,
+    };
+    unsafe { std::env::remove_var("AGENTCHAT_MIGRATE_FAIL_AFTER") };
+    if !injected.contains("备份在") {
+        return fail(&format!("失败信息未带备份路径: {injected}"));
+    }
+    // 模拟用户从备份恢复（备份文件名见 backups/ 目录最新一份）
+    let backups_dir = dir.join("backups");
+    let mut backups: Vec<_> = fs::read_dir(&backups_dir)
+        .map(|rd| rd.filter_map(|e| e.ok().map(|x| x.path())).collect())
+        .unwrap_or_default();
+    backups.sort();
+    let Some(backup) = backups.last() else {
+        return fail("失败后未找到备份文件");
+    };
+    let _ = fs::remove_file(dir.join("agentchat.db-wal"));
+    let _ = fs::remove_file(dir.join("agentchat.db-shm"));
+    if let Err(e) = fs::copy(backup, &db_path) {
+        return fail(&format!("restore from backup: {e}"));
+    }
+    let db = match Db::open(&db_path) {
+        Ok(d) => d,
+        Err(e) => return fail(&format!("re-migrate after restore: {e}")),
+    };
+    if let Err(e) = verify_migrated(&db, &db_path) {
+        return fail(&format!("after restore: {e}"));
+    }
+    println!("[selftest-migrate] failure→rollback→restore→re-migrate OK");
+    println!("[selftest-migrate] PASS");
+    0
+}
+
+/// 造一个 v0（M1 旧 schema）fixture 库：1 persona + 1 DM 房 + 4 消息 + 2 成功 run（含 session）
+fn build_v0_fixture(db_path: &Path) -> Result<(), String> {
+    let conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+CREATE TABLE personas(
+  id TEXT PRIMARY KEY, engine TEXT NOT NULL, name TEXT NOT NULL,
+  color TEXT NOT NULL, bound INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+CREATE TABLE rooms(
+  id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+  members TEXT NOT NULL, cwd TEXT NOT NULL, permission TEXT NOT NULL DEFAULT 'project',
+  default_target TEXT NOT NULL DEFAULT 'last', max_auto_turns INTEGER NOT NULL DEFAULT 6,
+  dm_settings TEXT, created_at TEXT NOT NULL);
+CREATE TABLE messages(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, room_id TEXT NOT NULL, sender TEXT NOT NULL,
+  role TEXT NOT NULL, text TEXT NOT NULL, run_id TEXT, reply_to INTEGER, created_at TEXT NOT NULL);
+CREATE INDEX idx_messages_room ON messages(room_id, id);
+CREATE TABLE runs(
+  id TEXT PRIMARY KEY, room_id TEXT, persona_id TEXT, task_json TEXT NOT NULL,
+  status TEXT, session_id TEXT, tokens INTEGER, duration_s REAL, synthesized INTEGER DEFAULT 0,
+  answer_text TEXT, created_at TEXT NOT NULL, finished_at TEXT);
+CREATE INDEX idx_runs_room ON runs(room_id, persona_id, finished_at);
+CREATE TABLE run_nodes(
+  id TEXT PRIMARY KEY, run_id TEXT NOT NULL, node_seq INTEGER, persona_id TEXT,
+  depends_on TEXT, status TEXT, winner INTEGER DEFAULT 0);
+CREATE TABLE scores(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, persona_id TEXT NOT NULL, room_id TEXT,
+  event TEXT NOT NULL, delta INTEGER NOT NULL, detail TEXT, created_at TEXT NOT NULL);
+INSERT INTO personas VALUES('p-fixture1','dsh','DeepSeek Harness','#0a84ff',1,'2026-11-26T10:00:00Z');
+INSERT INTO rooms(id,kind,name,members,cwd,permission,default_target,max_auto_turns,created_at)
+  VALUES('r-fixture1','dm','DeepSeek Harness','[\"p-fixture1\"]','/tmp/fixture-cwd','project','last',6,'2026-11-26T10:00:01Z');
+INSERT INTO messages(room_id,sender,role,text,run_id,created_at) VALUES
+  ('r-fixture1','user','user','hi',NULL,'2026-11-26T10:00:10Z'),
+  ('r-fixture1','p-fixture1','persona','PONG','msg-run1','2026-11-26T10:00:20Z'),
+  ('r-fixture1','user','user','what did I say',NULL,'2026-11-26T10:00:30Z'),
+  ('r-fixture1','p-fixture1','persona','PONG','msg-run2','2026-11-26T10:00:40Z');
+INSERT INTO runs(id,room_id,persona_id,task_json,status,session_id,tokens,duration_s,synthesized,answer_text,created_at,finished_at) VALUES
+  ('msg-run1','r-fixture1','p-fixture1','{}','success','session-fixture-1',120,2.5,0,'PONG','2026-11-26T10:00:11Z','2026-11-26T10:00:20Z'),
+  ('msg-run2','r-fixture1','p-fixture1','{}','success','session-fixture-1',98,2.1,0,'PONG','2026-11-26T10:00:31Z','2026-11-26T10:00:40Z');",
+    )
+    .map_err(|e| e.to_string())?;
+    // 确保 WAL 模式落盘（验收含 WAL 库迁移）
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if mode != "wal" {
+        return Err(format!("fixture not in WAL mode: {mode}"));
+    }
+    Ok(())
+}
+
+/// 迁移后全量断言（§4.10 验收：历史可打开、气泡 status/tokens 不丢、session 不丢）
+fn verify_migrated(db: &Db, db_path: &Path) -> Result<(), String> {
+    // user_version = 1
+    let v: i64 = db
+        .0
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if v != 1 {
+        return Err(format!("user_version={v} != 1"));
+    }
+    // messages：id 保留 + client_msg_id backfill + legacy_run_id 保留
+    let msgs: Vec<(i64, String, Option<String>)> = db
+        .0
+        .prepare("SELECT id, client_msg_id, legacy_run_id FROM messages ORDER BY id")
+        .map_err(|e| e.to_string())?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(|x| x.ok())
+        .collect();
+    if msgs.is_empty() {
+        return Err("messages empty after migration".into());
+    }
+    for (id, cmid, legacy) in &msgs {
+        if *cmid != format!("msg-legacy-{id}") {
+            return Err(format!("client_msg_id backfill wrong: {cmid}"));
+        }
+        let _ = legacy; // 有 run 的气泡应保留 legacy_run_id（下方 history 断言覆盖）
+    }
+    // room_history：persona 气泡 status/tokens 不丢（legacy_run_id join 路径）
+    let room_id: String = db
+        .0
+        .query_row("SELECT id FROM rooms LIMIT 1", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    let history = db.room_history(&room_id, 200)?;
+    let bubbles: Vec<_> = history
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| m["role"] == "persona")
+        .collect();
+    if bubbles.is_empty() {
+        return Err("no persona bubbles in history".into());
+    }
+    for b in &bubbles {
+        if b["status"].as_str() != Some("success") {
+            return Err(format!("bubble lost status: {b}"));
+        }
+        if b["tokens"].as_i64().is_none() {
+            return Err(format!("bubble lost tokens: {b}"));
+        }
+    }
+    // room_persona_sessions backfill + last_session（K3 权威表）
+    let pid = bubbles[0]["sender"].as_str().unwrap_or("").to_string();
+    if db.last_session(&room_id, &pid).is_none() {
+        return Err("room_persona_sessions not backfilled / last_session lost".into());
+    }
+    // room_members backfill + get_room members
+    let room = db.get_room(&room_id)?;
+    if room["members"].as_array().map(|a| a.is_empty()).unwrap_or(true) {
+        return Err("room_members not backfilled".into());
+    }
+    if room["owner_persona_id"].as_str().is_none() {
+        return Err("owner_persona_id not backfilled".into());
+    }
+    // 新表齐备
+    for t in ["turns", "room_summaries", "approvals", "room_persona_sessions", "room_members"] {
+        let n: i64 = db
+            .0
+            .query_row(
+                &format!("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{t}'"),
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if n != 1 {
+            return Err(format!("table {t} missing"));
+        }
+    }
+    // runs 部分唯一索引存在
+    let n: i64 = db
+        .0
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='uq_runs_turn'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if n != 1 {
+        return Err("uq_runs_turn index missing".into());
+    }
+    // 备份存在且目录 0700
+    let backups = db_path.parent().unwrap().join("backups");
+    let meta = fs::metadata(&backups).map_err(|e| format!("backups dir: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o777 != 0o700 {
+            return Err("backups dir not 0700".into());
+        }
+    }
+    let has_backup = fs::read_dir(&backups)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .any(|e| e.path().extension().map(|x| x == "db").unwrap_or(false));
+    if !has_backup {
+        return Err("no backup file created".into());
+    }
+    // client_msg_id 自铸格式（msg-<26 字符 ulid>）
+    let (_, cmid) = db.add_message(&room_id, "user", "user", "selftest ulid", None, None)?;
+    if !cmid.starts_with("msg-") || cmid.len() != 30 {
+        return Err(format!("client_msg_id format wrong: {cmid}"));
+    }
+    Ok(())
 }
