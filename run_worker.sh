@@ -73,6 +73,8 @@ TIMEOUT_SECS="${T_TIMEOUT:-$DEFAULT_TIMEOUT}"
 
 OUT_DIR="$MESH_ROOT/results/$T_ID"
 mkdir -p "$OUT_DIR"
+# K0: running 标记（完成协议：存在即在途；正常结束/写结果后删除，watchdog 强杀时由调用方清理）
+date -u +%Y-%m-%dT%H:%M:%SZ > "$OUT_DIR/running"
 STDOUT_F="$OUT_DIR/stdout.txt"
 STDERR_F="$OUT_DIR/stderr.txt"
 
@@ -171,21 +173,46 @@ if [[ -n "${SKIP_EXEC:-}" ]]; then
   EXIT_CODE=1
 else
   # ---------- 环境净化：子任务运行在 worker 自身的认证与权限模型 ----------
-  # 白名单保留系统必需与各 worker 凭证；剔除宿主 agent 注入（CATPAW_* 等审批/沙箱变量）
-  typeset -a ENVARGS
-  eval "ENVARGS=($(python3 - <<'PYCLEAN'
+# 白名单保留系统必需与各 worker 凭证；剔除宿主 agent 注入（CATPAW_* 等审批/沙箱变量）
+# K2: per-worker 凭证用精确变量名（拒绝宽前缀，防宿主 CODEX_SESSION_ID 等控制变量泄漏）；
+#     MESH_ENV_EXTRA_VARS 可追加精确变量名，denylist（AWS_*/GITHUB_TOKEN/DYLD_*/CODEX 会话控制变量）优先拦截
+typeset -a ENVARGS
+eval "ENVARGS=($(python3 - <<'PYCLEAN'
 import os, shlex
 EXACT = {"PATH","HOME","LANG","LC_ALL","TMPDIR","TERM","USER","LOGNAME","SHELL","EDITOR","SSH_AUTH_SOCK","TZ",
-         "https_proxy","http_proxy","no_proxy","all_proxy","HTTPS_PROXY","HTTP_PROXY","NO_PROXY","ALL_PROXY"}
+"https_proxy","http_proxy","no_proxy","all_proxy","HTTPS_PROXY","HTTP_PROXY","NO_PROXY","ALL_PROXY"}
 PREFIX = ("ANTHROPIC_","MAGPIE_","WORKBUDDY_","OPENAI_","DEEPSEEK_","ARK_","QWEN_","PI_","XDG_","VOLC_","GEMINI_","GOOGLE_","HF_")
-keep = {k: v for k, v in os.environ.items() if k in EXACT or k.startswith(PREFIX)}
+# K2: 精确变量名（逐一核对真实凭证变量；绝不加 CODEX_ 等宽前缀）
+EXTRA_EXACT = {"CODEX_API_KEY","OPENCODE_API_KEY","HERMES_API_KEY"}
+DENY = {"AWS_SECRET_ACCESS_KEY","AWS_ACCESS_KEY_ID","GITHUB_TOKEN","GH_TOKEN",
+        "CODEX_SESSION_ID","CODEX_THREAD_ID","CODEX_PERMISSION_PROFILE","CODEX_SANDBOX"}
+DENY_PREFIX = ("DYLD_",)
+for name in os.environ.get("MESH_ENV_EXTRA_VARS", "").split():
+    if not name or "*" in name or "?" in name:
+        continue  # 拒绝空串/通配符
+    if name in DENY or name.startswith(DENY_PREFIX):
+        continue
+    EXTRA_EXACT.add(name)
+keep = {}
+for k, v in os.environ.items():
+    if k in DENY or k.startswith(DENY_PREFIX):
+        continue  # denylist 全局优先
+    if k in EXACT or k in EXTRA_EXACT or k.startswith(PREFIX):
+        keep[k] = v
 print(" ".join(f"{k}={shlex.quote(v)}" for k, v in keep.items()))
 PYCLEAN
 ))"
-  while true; do
-    # stdin 统一封 /dev/null：任务全部由 brief 提供，防止 worker（如 codex）检测非 TTY 时误读 stdin
-    env -i "${ENVARGS[@]}" timeout "$TIMEOUT_SECS" "${CMD[@]}" < /dev/null >"$STDOUT_F" 2>"$STDERR_F"
-    EXIT_CODE=$?
+# K1: timeout 探测——存在则用（MESH_TIMEOUT_BIN 可覆盖）；不存在直接 exec，超时由调用方（Rust watchdog）兜底
+TIMEOUT_BIN="${MESH_TIMEOUT_BIN:-}"
+if [[ -z "$TIMEOUT_BIN" ]] && command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=timeout; fi
+while true; do
+# stdin 统一封 /dev/null：任务全部由 brief 提供，防止 worker（如 codex）检测非 TTY 时误读 stdin
+if [[ -n "$TIMEOUT_BIN" ]]; then
+  env -i "${ENVARGS[@]}" "$TIMEOUT_BIN" "$TIMEOUT_SECS" "${CMD[@]}" < /dev/null >"$STDOUT_F" 2>"$STDERR_F"
+else
+  env -i "${ENVARGS[@]}" "${CMD[@]}" < /dev/null >"$STDOUT_F" 2>"$STDERR_F"
+fi
+EXIT_CODE=$?
     if [[ $EXIT_CODE -eq 0 || $ATTEMPT -ge $MAX_ATTEMPTS ]]; then
       break
     fi
@@ -457,15 +484,21 @@ result = {
     "tokens": tokens,
     "cost_usd": cost_usd,
 }
-with open(os.path.join(out, "result.json"), "w") as f:
+# K0: 临时文件 + rename 原子提交（消除 watcher 读到 partial write / 旧结果残留）
+_res = os.path.join(out, "result.json")
+with open(_res + ".tmp", "w") as f:
     json.dump(result, f, ensure_ascii=False, indent=2)
+os.replace(_res + ".tmp", _res)
 # 归一化正文：JSON 信封类输出（如 arkcli）提取 content 落 answer.txt，
 # 供 pipeline 节点间数据流转使用（避免信封/reasoning 噪音下传）
-with open(os.path.join(out, "answer.txt"), "w") as f:
+_ans = os.path.join(out, "answer.txt")
+with open(_ans + ".tmp", "w") as f:
     f.write(target)
+os.replace(_ans + ".tmp", _ans)
 print(status)
 PYEOF
 )
+rm -f "$OUT_DIR/running"  # K0: 结果落盘，清除 running 标记
 
 print -r -- "[$STATUS] $T_ID ($T_WORKER) ${DURATION}s exit=$EXIT_CODE -> $OUT_DIR/result.json"
 

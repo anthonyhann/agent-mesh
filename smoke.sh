@@ -67,6 +67,11 @@ else
 fi
 
 if [[ $QUICK -eq 1 ]]; then
+  # 2.4 内核回归（K0/K1/K2：running 标记/原子写、timeout 探测、env 白名单；假 worker 无模型成本）
+  if [[ -x "$MESH/tests/test-kernel.sh" ]]; then
+    section "内核回归（K0/K1/K2）"
+    "$MESH/tests/test-kernel.sh" && ok "tests/test-kernel.sh 全绿" || bad "tests/test-kernel.sh 有用例失败"
+  fi
   print -r -- "\nsmoke(quick): PASS=$PASS FAIL=$FAIL"
   [[ $FAIL -eq 0 ]] && exit 0 || exit 1
 fi
