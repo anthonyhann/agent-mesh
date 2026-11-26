@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 interface Persona { id: string; engine: string; name: string; color: string; bound: boolean }
@@ -14,6 +15,46 @@ interface Msg {
   duration_s?: number | null; session_id?: string | null;
 }
 interface Doctor { tools: Record<string, string | null>; auth: Record<string, boolean>; mesh_root: string; path: string }
+
+/* ---------- SF Symbols 风格图标（细描边圆角内联 SVG） ---------- */
+
+function Icon({ children, size = 19 }: { children: ReactNode; size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round">
+      {children}
+    </svg>
+  );
+}
+const I = {
+  chat: <path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5c-1.4 0-2.7-.3-3.8-.9L3 21l1.9-5.7a8.5 8.5 0 1 1 16.1-3.8z" />,
+  robot: <>
+    <rect x="4.5" y="8" width="15" height="11" rx="3.2" />
+    <path d="M12 4.5V8" /><path d="M2.5 12.5v3M21.5 12.5v3" />
+    <circle cx="9.3" cy="13.3" r="1.15" fill="currentColor" stroke="none" />
+    <circle cx="14.7" cy="13.3" r="1.15" fill="currentColor" stroke="none" />
+  </>,
+  plus: <path d="M12 5.5v13M5.5 12h13" />,
+  compose: <>
+    <path d="M12 20h8.5" />
+    <path d="M16.4 3.6a2.1 2.1 0 0 1 3 3L7.2 18.8l-4 1 1-4L16.4 3.6z" />
+  </>,
+  search: <><circle cx="11" cy="11" r="6.5" /><path d="M20.5 20.5 15.7 15.7" /></>,
+  more: <>
+    <circle cx="5.5" cy="12" r="1.3" fill="currentColor" stroke="none" />
+    <circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none" />
+    <circle cx="18.5" cy="12" r="1.3" fill="currentColor" stroke="none" />
+  </>,
+  smile: <>
+    <circle cx="12" cy="12" r="8.5" />
+    <circle cx="9.1" cy="9.8" r="1.1" fill="currentColor" stroke="none" />
+    <circle cx="14.9" cy="9.8" r="1.1" fill="currentColor" stroke="none" />
+    <path d="M8.3 14.2c.9 1.3 2.1 2 3.7 2s2.8-.7 3.7-2" />
+  </>,
+  bolt: <path d="M13 2.5 4.5 14H11l-1 7.5L18.5 10H12l1-7.5z" />,
+  clip: <path d="M20.8 11.3 12.3 19.8a5.4 5.4 0 0 1-7.6-7.6l9-9a3.6 3.6 0 0 1 5.1 5.1l-9 9a1.8 1.8 0 0 1-2.5-2.5l8.2-8.2" />,
+  send: <path d="M12 18.5v-13M5.8 11.7 12 5.5l6.2 6.2" />,
+};
 
 export default function App() {
   const [personas, setPersonas] = useState<Persona[]>([]);
@@ -50,17 +91,17 @@ export default function App() {
     setTab("chat");
   }, [refreshRooms]);
 
-  if (!booted) return <div className="boot">🐈‍⬛ AgentChat 启动中…</div>;
+  if (!booted) return <div className="boot">AgentChat 启动中…</div>;
 
   return (
     <div className="app">
-      {/* 左：icon rail（WhatsApp 式：顶头像、中间导航、底部动作） */}
+      {/* 左：icon rail（macOS 式：顶头像、中导航、底动作） */}
       <nav className="rail">
         <div className="rail-avatar" title="我">H</div>
-        <button className={`rail-btn ${tab === "chat" ? "on" : ""}`} title="聊天" onClick={() => setTab("chat")}>💬</button>
-        <button className={`rail-btn ${tab === "contacts" ? "on" : ""}`} title="联系人" onClick={() => setTab("contacts")}>🤖</button>
+        <button className={`rail-btn ${tab === "chat" ? "on" : ""}`} title="聊天" onClick={() => setTab("chat")}><Icon>{I.chat}</Icon></button>
+        <button className={`rail-btn ${tab === "contacts" ? "on" : ""}`} title="联系人" onClick={() => setTab("contacts")}><Icon>{I.robot}</Icon></button>
         <div className="rail-spacer" />
-        <button className="rail-btn" title="绑定 Agent" onClick={() => setShowBind(true)}>➕</button>
+        <button className="rail-btn" title="绑定 Agent" onClick={() => setShowBind(true)}><Icon>{I.plus}</Icon></button>
       </nav>
 
       {/* 中：列表栏 */}
@@ -111,19 +152,19 @@ function SessionList({ rooms, personas, activeId, onSelect, onBind, onCompose }:
     <>
       <div className="sidebar-head">
         <span className="sb-title">会话</span>
-        <button className="icon-btn" title="发起私聊" onClick={onCompose}>✎</button>
+        <button className="icon-btn" title="发起私聊" onClick={onCompose}><Icon size={17}>{I.compose}</Icon></button>
       </div>
-      <div className="search"><input placeholder="搜索会话" value={q} onChange={(e) => setQ(e.target.value)} /></div>
+      <div className="search"><input placeholder="搜索" value={q} onChange={(e) => setQ(e.target.value)} /></div>
       <div className="list">
         <div className="add-agent" onClick={onBind}>
-          <div className="add-icon">➕</div><div className="add-text">添加 Agent</div>
+          <div className="add-icon"><Icon size={18}>{I.plus}</Icon></div><div className="add-text">添加 Agent</div>
         </div>
         {filtered.length === 0 && <div className="empty">还没有会话</div>}
         {filtered.map((r) => {
           const first = r.members[0] ? personaOf(r.members[0]) : undefined;
           return (
             <div key={r.id} className={`conv ${activeId === r.id ? "on" : ""}`} onClick={() => onSelect(r)}>
-              <Avatar name={r.name} color={first?.color ?? "#8696a0"} group={r.kind === "group"} />
+              <Avatar name={r.name} color={first?.color ?? "#98989f"} group={r.kind === "group"} />
               <div className="conv-main">
                 <div className="conv-top">
                   <span className="conv-name">{r.name}</span>
@@ -165,7 +206,7 @@ function ContactList({ personas, onDm, onBind }:
       <div className="sidebar-head"><span className="sb-title">联系人 · {personas.length}</span></div>
       <div className="list">
         <div className="add-agent" onClick={onBind}>
-          <div className="add-icon">➕</div><div className="add-text">添加 Agent</div>
+          <div className="add-icon"><Icon size={18}>{I.plus}</Icon></div><div className="add-text">添加 Agent</div>
         </div>
         {personas.map((p) => (
           <div key={p.id} className="conv" onClick={() => onDm(p.id)}>
@@ -253,7 +294,7 @@ function ChatView({ room, personas, onSent }:
   const nameOf = (sender: string) =>
     sender === "user" ? "我" : personas.find((p) => p.id === sender)?.name ?? sender;
   const colorOf = (sender: string) =>
-    personas.find((p) => p.id === sender)?.color ?? "#8696a0";
+    personas.find((p) => p.id === sender)?.color ?? "#98989f";
 
   // client_msg_id：每次发送自铸，重试沿用 → UNIQUE(room_id, client_msg_id) 幂等（§4.11）
   const pendingIdRef = useRef<string | null>(null);
@@ -279,6 +320,9 @@ function ChatView({ room, personas, onSent }:
   };
 
   const firstPersona = room.members[0] ? personas.find((p) => p.id === room.members[0]) : undefined;
+  // Messages 式回执：只挂最后一条我发的消息
+  let lastUserIdx = -1;
+  history.forEach((m, i) => { if (m.role === "user") lastUserIdx = i; });
 
   return (
     <div className="chat">
@@ -289,26 +333,28 @@ function ChatView({ room, personas, onSent }:
           <div className="ch-status"><span className="online-dot" />在线 · {room.permission}</div>
         </div>
         <div className="ch-actions">
-          <button className="icon-btn" title="搜索聊天记录（即将上线）" disabled>🔍</button>
-          <button className="icon-btn" title="更多（即将上线）" disabled>⋯</button>
+          <button className="icon-btn" title="搜索聊天记录（即将上线）" disabled><Icon size={17}>{I.search}</Icon></button>
+          <button className="icon-btn" title="更多（即将上线）" disabled><Icon size={17}>{I.more}</Icon></button>
         </div>
       </header>
       <div className="bubbles">
         {history.map((m, i) => {
           const prev = history[i - 1];
+          const next = history[i + 1];
           const divider = needDivider(prev, m);
           const me = m.role === "user";
-          // 分组：同发送者、无分隔 → 后续消息紧凑（省头像/名字）
+          // 分组：同发送者连续消息为一组；头像挂在组尾（iMessage 式），组尾气泡切角
           const first = !prev || prev.sender !== m.sender || divider;
+          const last = !next || next.sender !== m.sender || needDivider(m, next);
           const answered = me && history.some((x, j) => j > i && x.role !== "user");
           return (
             <div key={m.id}>
-              {divider && <div className="time-divider"><span>{fmtDivider(m.created_at)}</span></div>}
+              {divider && <div className="time-divider">{fmtDivider(m.created_at)}</div>}
               <div className={`bubble-row ${me ? "me" : ""} ${first ? "" : "compact"}`}>
-                {!me && (first
+                {!me && (last
                   ? <Avatar name={nameOf(m.sender)} color={colorOf(m.sender)} small />
                   : <div className="avatar-sp" />)}
-                <div className={`bubble ${me ? "me" : ""} ${first ? "first" : ""}`}>
+                <div className={`bubble ${me ? "me" : ""} ${last ? "last" : ""}`}>
                   {!me && first && room.kind === "group" && (
                     <div className="b-name" style={{ color: colorOf(m.sender) }}>{nameOf(m.sender)}</div>
                   )}
@@ -318,32 +364,34 @@ function ChatView({ room, personas, onSent }:
                     {m.duration_s != null && <span className="b-meta">{Math.round(m.duration_s)}s</span>}
                     {m.status && m.status !== "success" && <span className="bad">{m.status}</span>}
                     <span className="b-time">{hm(m.created_at)}</span>
-                    {me && <span className={`ticks ${answered ? "read" : ""}`}>{answered ? "✓✓" : "✓"}</span>}
                   </div>
                 </div>
-                {me && (first ? <div className="avatar small me-avatar">H</div> : <div className="avatar-sp" />)}
+                {me && (last ? <div className="avatar small me-avatar">H</div> : <div className="avatar-sp" />)}
               </div>
+              {i === lastUserIdx && (
+                <div className="receipt">{answered ? "已读" : "已送达"}</div>
+              )}
             </div>
           );
         })}
         {sending && (
           <div className="bubble-row">
             {firstPersona && <Avatar name={firstPersona.name} color={firstPersona.color} small />}
-            <div className="bubble first typing"><span /><span /><span /></div>
+            <div className="bubble last typing"><span /><span /><span /></div>
           </div>
         )}
         <div ref={bottomRef} />
       </div>
       <div className="composer">
         <div className="composer-pill">
-          <button className="tool" title="表情（即将上线）" disabled>😊</button>
-          <button className="tool" title="快捷指令（即将上线）" disabled>⚡</button>
-          <button className="tool" title="图片/文件（即将上线）" disabled>📎</button>
+          <button className="tool" title="表情（即将上线）" disabled><Icon size={18}>{I.smile}</Icon></button>
+          <button className="tool" title="快捷指令（即将上线）" disabled><Icon size={18}>{I.bolt}</Icon></button>
+          <button className="tool" title="图片/文件（即将上线）" disabled><Icon size={18}>{I.clip}</Icon></button>
           <textarea ref={taRef} value={input} rows={1} placeholder={`发送给 ${room.name}`}
             onChange={(e) => { setInput(e.target.value); grow(); }}
             onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
         </div>
-        <button className="send" disabled={sending || !input.trim()} onClick={send}>➤</button>
+        <button className="send" disabled={sending || !input.trim()} onClick={send}><Icon size={17}>{I.send}</Icon></button>
       </div>
     </div>
   );
