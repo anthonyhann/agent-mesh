@@ -54,8 +54,9 @@ export default function App() {
 
   return (
     <div className="app">
-      {/* 左：icon rail */}
+      {/* 左：icon rail（WhatsApp 式：顶头像、中间导航、底部动作） */}
       <nav className="rail">
+        <div className="rail-avatar" title="我">H</div>
         <button className={`rail-btn ${tab === "chat" ? "on" : ""}`} title="聊天" onClick={() => setTab("chat")}>💬</button>
         <button className={`rail-btn ${tab === "contacts" ? "on" : ""}`} title="联系人" onClick={() => setTab("contacts")}>🤖</button>
         <div className="rail-spacer" />
@@ -66,7 +67,8 @@ export default function App() {
       <aside className="sidebar">
         {tab === "chat" ? (
           <SessionList rooms={rooms} personas={personas} activeId={activeRoom?.id ?? null}
-            onSelect={(r) => setActiveRoom(r)} onBind={() => setShowBind(true)} />
+            onSelect={(r) => setActiveRoom(r)} onBind={() => setShowBind(true)}
+            onCompose={() => setTab("contacts")} />
         ) : (
           <ContactList personas={personas} onDm={openDm} onBind={() => setShowBind(true)} />
         )}
@@ -80,7 +82,8 @@ export default function App() {
         ) : (
           <div className="placeholder">
             <div className="ph-logo">🐈‍⬛</div>
-            <div className="ph-text">选择一个会话，或从联系人发起私聊</div>
+            <div className="ph-title">圆桌派 AgentChat</div>
+            <div className="ph-text">本地 CLI Agent 都是你的联系人<br />选择左侧会话，或从联系人发起私聊</div>
           </div>
         )}
       </main>
@@ -97,8 +100,8 @@ export default function App() {
 
 /* ---------- 会话列表 ---------- */
 
-function SessionList({ rooms, personas, activeId, onSelect, onBind }:
-  { rooms: Room[]; personas: Persona[]; activeId: string | null; onSelect: (r: Room) => void; onBind: () => void }) {
+function SessionList({ rooms, personas, activeId, onSelect, onBind, onCompose }:
+  { rooms: Room[]; personas: Persona[]; activeId: string | null; onSelect: (r: Room) => void; onBind: () => void; onCompose: () => void }) {
   const [q, setQ] = useState("");
   const filtered = rooms.filter((r) =>
     !q || r.name.toLowerCase().includes(q.toLowerCase()) || (r.last_message ?? "").toLowerCase().includes(q.toLowerCase()));
@@ -106,22 +109,28 @@ function SessionList({ rooms, personas, activeId, onSelect, onBind }:
 
   return (
     <>
-      <div className="search"><input placeholder="搜索会话" value={q} onChange={(e) => setQ(e.target.value)} /></div>
-      <div className="add-agent" onClick={onBind}>
-        <div className="add-icon">➕</div><div className="add-text">添加 Agent</div>
+      <div className="sidebar-head">
+        <span className="sb-title">会话</span>
+        <button className="icon-btn" title="发起私聊" onClick={onCompose}>✎</button>
       </div>
+      <div className="search"><input placeholder="搜索会话" value={q} onChange={(e) => setQ(e.target.value)} /></div>
       <div className="list">
+        <div className="add-agent" onClick={onBind}>
+          <div className="add-icon">➕</div><div className="add-text">添加 Agent</div>
+        </div>
         {filtered.length === 0 && <div className="empty">还没有会话</div>}
         {filtered.map((r) => {
           const first = r.members[0] ? personaOf(r.members[0]) : undefined;
           return (
             <div key={r.id} className={`conv ${activeId === r.id ? "on" : ""}`} onClick={() => onSelect(r)}>
-              <Avatar name={r.name} color={first?.color ?? "#8e8e93"} group={r.kind === "group"} />
+              <Avatar name={r.name} color={first?.color ?? "#8696a0"} group={r.kind === "group"} />
               <div className="conv-main">
-                <div className="conv-name">{r.name}</div>
+                <div className="conv-top">
+                  <span className="conv-name">{r.name}</span>
+                  <span className="conv-at">{fmtListTime(r.last_at)}</span>
+                </div>
                 <div className="conv-last">{previewOf(r)}</div>
               </div>
-              <div className="conv-at">{fmtListTime(r.last_at)}</div>
             </div>
           );
         })}
@@ -138,7 +147,6 @@ function previewOf(r: Room): string {
 
 function fmtListTime(at?: string | null): string {
   if (!at) return "";
-  // created_at 是 UTC ISO：就地显示 HH:MM（今天）或 MM-DD
   const d = new Date(at);
   const now = new Date();
   const sameDay = d.toDateString() === now.toDateString();
@@ -154,16 +162,16 @@ function ContactList({ personas, onDm, onBind }:
   { personas: Persona[]; onDm: (id: string) => void; onBind: () => void }) {
   return (
     <>
-      <div className="sidebar-title">联系人 · {personas.length}</div>
-      <div className="add-agent" onClick={onBind}>
-        <div className="add-icon">➕</div><div className="add-text">添加 Agent</div>
-      </div>
+      <div className="sidebar-head"><span className="sb-title">联系人 · {personas.length}</span></div>
       <div className="list">
+        <div className="add-agent" onClick={onBind}>
+          <div className="add-icon">➕</div><div className="add-text">添加 Agent</div>
+        </div>
         {personas.map((p) => (
           <div key={p.id} className="conv" onClick={() => onDm(p.id)}>
             <Avatar name={p.name} color={p.color} />
             <div className="conv-main">
-              <div className="conv-name">{p.name}</div>
+              <div className="conv-top"><span className="conv-name">{p.name}</span></div>
               <div className="conv-last">{p.engine} · 在线</div>
             </div>
             <span className="online-dot" />
@@ -234,6 +242,7 @@ function ChatView({ room, personas, onSent }:
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
 
   const refresh = useCallback(async () => {
     setHistory(await invoke<Msg[]>("room_history", { roomId: room.id }));
@@ -244,7 +253,7 @@ function ChatView({ room, personas, onSent }:
   const nameOf = (sender: string) =>
     sender === "user" ? "我" : personas.find((p) => p.id === sender)?.name ?? sender;
   const colorOf = (sender: string) =>
-    sender === "user" ? "#0a84ff" : personas.find((p) => p.id === sender)?.color ?? "#8e8e93";
+    personas.find((p) => p.id === sender)?.color ?? "#8696a0";
 
   // client_msg_id：每次发送自铸，重试沿用 → UNIQUE(room_id, client_msg_id) 幂等（§4.11）
   const pendingIdRef = useRef<string | null>(null);
@@ -253,6 +262,7 @@ function ChatView({ room, personas, onSent }:
     if (!text || sending) return;
     if (!pendingIdRef.current) pendingIdRef.current = mintClientMsgId();
     setInput(""); setSending(true);
+    if (taRef.current) taRef.current.style.height = "";
     try {
       const h = await invoke<Msg[]>("send_message", { roomId: room.id, text, clientMsgId: pendingIdRef.current });
       setHistory(h);
@@ -263,41 +273,55 @@ function ChatView({ room, personas, onSent }:
     } finally { setSending(false); }
   };
 
+  const grow = () => {
+    const t = taRef.current;
+    if (t) { t.style.height = "0"; t.style.height = Math.min(t.scrollHeight, 132) + "px"; }
+  };
+
   const firstPersona = room.members[0] ? personas.find((p) => p.id === room.members[0]) : undefined;
 
   return (
     <div className="chat">
       <header className="chat-head">
-        <div className="ch-name">{room.name}</div>
-        <div className="ch-status">
-          <span className="online-dot" /> 在线
-          <span className="perm-badge">{room.permission}</span>
+        {firstPersona && <Avatar name={firstPersona.name} color={firstPersona.color} small />}
+        <div className="ch-meta">
+          <div className="ch-name">{room.name}</div>
+          <div className="ch-status"><span className="online-dot" />在线 · {room.permission}</div>
+        </div>
+        <div className="ch-actions">
+          <button className="icon-btn" title="搜索聊天记录（即将上线）" disabled>🔍</button>
+          <button className="icon-btn" title="更多（即将上线）" disabled>⋯</button>
         </div>
       </header>
       <div className="bubbles">
         {history.map((m, i) => {
-          const divider = needDivider(history[i - 1], m) ? (
-            <div key={`t-${m.id}`} className="time-divider">{fmtDivider(m.created_at)}</div>
-          ) : null;
+          const prev = history[i - 1];
+          const divider = needDivider(prev, m);
+          const me = m.role === "user";
+          // 分组：同发送者、无分隔 → 后续消息紧凑（省头像/名字）
+          const first = !prev || prev.sender !== m.sender || divider;
+          const answered = me && history.some((x, j) => j > i && x.role !== "user");
           return (
             <div key={m.id}>
-              {divider}
-              <div className={`bubble-row ${m.role === "user" ? "me" : ""}`}>
-                {m.role !== "user" && <Avatar name={nameOf(m.sender)} color={colorOf(m.sender)} small />}
-                <div className={`bubble ${m.role === "user" ? "me" : ""}`}>
-                  {m.role !== "user" && (
-                    <div className="bubble-head">
-                      <span style={{ color: colorOf(m.sender) }}>{nameOf(m.sender)}</span>
-                      <span className="meta">
-                        {m.tokens != null && `⛁ ${m.tokens.toLocaleString()} tok · `}
-                        {m.duration_s != null && `${Math.round(m.duration_s)}s · `}
-                        {m.status && m.status !== "success" && <b className="bad">{m.status}</b>}
-                      </span>
-                    </div>
+              {divider && <div className="time-divider"><span>{fmtDivider(m.created_at)}</span></div>}
+              <div className={`bubble-row ${me ? "me" : ""} ${first ? "" : "compact"}`}>
+                {!me && (first
+                  ? <Avatar name={nameOf(m.sender)} color={colorOf(m.sender)} small />
+                  : <div className="avatar-sp" />)}
+                <div className={`bubble ${me ? "me" : ""} ${first ? "first" : ""}`}>
+                  {!me && first && room.kind === "group" && (
+                    <div className="b-name" style={{ color: colorOf(m.sender) }}>{nameOf(m.sender)}</div>
                   )}
                   <pre className="bubble-text">{m.text}</pre>
+                  <div className="b-foot">
+                    {m.tokens != null && <span className="b-meta">⛁ {fmtTok(m.tokens)}</span>}
+                    {m.duration_s != null && <span className="b-meta">{Math.round(m.duration_s)}s</span>}
+                    {m.status && m.status !== "success" && <span className="bad">{m.status}</span>}
+                    <span className="b-time">{hm(m.created_at)}</span>
+                    {me && <span className={`ticks ${answered ? "read" : ""}`}>{answered ? "✓✓" : "✓"}</span>}
+                  </div>
                 </div>
-                {m.role === "user" && <div className="avatar small me-avatar">H</div>}
+                {me && (first ? <div className="avatar small me-avatar">H</div> : <div className="avatar-sp" />)}
               </div>
             </div>
           );
@@ -305,19 +329,20 @@ function ChatView({ room, personas, onSent }:
         {sending && (
           <div className="bubble-row">
             {firstPersona && <Avatar name={firstPersona.name} color={firstPersona.color} small />}
-            <div className="typing"><span /><span /><span /></div>
+            <div className="bubble first typing"><span /><span /><span /></div>
           </div>
         )}
         <div ref={bottomRef} />
       </div>
       <div className="composer">
-        <div className="composer-tools">
+        <div className="composer-pill">
+          <button className="tool" title="表情（即将上线）" disabled>😊</button>
           <button className="tool" title="快捷指令（即将上线）" disabled>⚡</button>
           <button className="tool" title="图片/文件（即将上线）" disabled>📎</button>
+          <textarea ref={taRef} value={input} rows={1} placeholder={`发送给 ${room.name}`}
+            onChange={(e) => { setInput(e.target.value); grow(); }}
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
         </div>
-        <textarea value={input} rows={2} placeholder={`发送给 ${room.name}（Enter 发送，Shift+Enter 换行）`}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
         <button className="send" disabled={sending || !input.trim()} onClick={send}>➤</button>
       </div>
     </div>
@@ -331,7 +356,17 @@ function needDivider(prev: Msg | undefined, cur: Msg): boolean {
 }
 function fmtDivider(at: string): string {
   const d = new Date(at);
+  const now = new Date();
+  const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  if (d.toDateString() === now.toDateString()) return hm;
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${hm}`;
+}
+function hm(at: string): string {
+  const d = new Date(at);
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+function fmtTok(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 }
 function mintClientMsgId(): string {
   // msg-<ulid 风格>：时间有序 + 随机，26 字符 Crockford base32（与后端 §4.11 同形）
