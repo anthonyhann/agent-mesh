@@ -15,6 +15,7 @@
 
 - **v2.4 → M2a-1 实施（2026-11-26）**：内核补一处会话契约修复——续聊任务结果 `session_id` 兜底为任务卡传入值（dsh 续接不改 session 目录 mtime，mtime 启发式在纯续接场景丢 id；结果 envelope §4.2 本就承诺 session_id）。
 - **v2.4 → M2a-2 实施（2026-11-26）**：① lane 落地——`add_user_message_turn`（消息+turn 单事务，重复 client_msg_id 复用既有 turn 绝不双消费）、`complete_turn`（§4.3 完成事务：run 落库+气泡+turn 终态单 SQLite 事务；run 按 `(turn_id,persona_id,attempt)` ON CONFLICT DO NOTHING，气泡按 `(room_id,turn_id,sender)` 查重幂等）、`recover_scan`+`recover_pending_turns`（启动崩溃恢复：无结果 running→interrupted；run 成功缺气泡→幂等补写不重跑；run 缺失/failed→按 attempt+1 重跑，快照优先无快照按触发原文重建任务卡）；② send_message 全链路改走 lane，执行失败也落 failed 终态不悬挂 turn；③ UI 重做对齐 ClawChat——持久三栏暗色骨架（icon rail+会话列表+聊天区）、搜索框+「添加 Agent」卡、在线绿点+权限徽标、右侧用户蓝气泡+H 头像、时间分隔、三点 typing 动画、输入区工具条（⚡📎占位）+➤发送、前端自铸 clientMsgId 重试复用（§4.11 第一层幂等贯通到 UI）、窗口 1024×680(min 880×560)。验收：selftest_lane 四用例（重复提交单气泡 / 崩溃补写不重跑 / 崩溃重跑只补缺失 / failed→attempt+1）PASS；selftest_chat 真 dsh 两轮续聊回归 PASS；selftest_migrate 回归 PASS。
+- **v2.4 → UI 打磨（2026-11-27）**：视觉语言两轮迭代定稿 Apple 体系（WhatsApp Dark × WeChat → Apple HIG）：① 图标全量 emoji→SF Symbols 风格内联 SVG（细描边 1.7、圆角、currentColor 单色）；② 配色 HIG 暗色——发出气泡 iMessage systemBlue #0A84FF、对方气泡 systemGray4 #3A3A3C、在线点 systemGreen #30D158、分隔线 0.5px 发丝线、文字 #F5F5F7/#98989F；③ 面板毛玻璃（backdrop-filter blur 28px saturate 1.6，rail/侧栏/头部/输入区）、头像圆形、气泡 18px 圆角 + iMessage 组尾切角、头像挂组尾、脚标悬停浮现、已读回执改 Messages 式「已读/已送达」挂最后一条我方消息、时间分隔居中小灰字、发送钮蓝色圆形 ↑。GUI 截图验收通过。
 
 ### 0.1 内核改动清单（有界，仅 K0-K4，全部向后兼容 + smoke 回归）
 
