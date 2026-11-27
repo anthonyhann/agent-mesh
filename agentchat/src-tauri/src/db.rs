@@ -414,17 +414,66 @@ impl Db {
     pub fn get_persona(&self, id: &str) -> Result<Value, String> {
         self.0
             .query_row(
-                "SELECT id,engine,name,color,bound FROM personas WHERE id=?1",
+                "SELECT id,engine,name,color,bound,COALESCE(behavior_md,'') FROM personas WHERE id=?1",
                 params![id],
                 |r| {
                     Ok(json!({
                         "id": r.get::<_,String>(0)?, "engine": r.get::<_,String>(1)?,
                         "name": r.get::<_,String>(2)?, "color": r.get::<_,String>(3)?,
                         "bound": r.get::<_,i64>(4)? == 1,
+                        "behavior_md": r.get::<_,String>(5)?,
                     }))
                 },
             )
             .map_err(|e| e.to_string())
+    }
+
+    /// persona 多开（§4.5）：同 engine 永远新建实例，不复用。name 缺省自动编号（「DeepSeek Harness 2」）。
+    pub fn add_persona(
+        &self,
+        engine: &str,
+        name: Option<&str>,
+        color: Option<&str>,
+    ) -> Result<Value, String> {
+        let auto = match name {
+            Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+            _ => {
+                let n: i64 = self
+                    .0
+                    .query_row(
+                        "SELECT COUNT(*) FROM personas WHERE engine=?1",
+                        params![engine],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                format!("{} {}", engine_label(engine), n + 1)
+            }
+        };
+        let id = format!("p-{}", uuid8());
+        self.0
+            .execute(
+                "INSERT INTO personas(id,engine,name,color,bound,created_at) VALUES(?1,?2,?3,?4,1,?5)",
+                params![
+                    id,
+                    engine,
+                    auto,
+                    color.unwrap_or_else(|| engine_color(engine)),
+                    now()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        self.get_persona(&id)
+    }
+
+    /// behavior.md 编辑（联系人名片入口）：整篇覆写
+    pub fn set_behavior(&self, persona_id: &str, behavior_md: &str) -> Result<(), String> {
+        self.0
+            .execute(
+                "UPDATE personas SET behavior_md=?2 WHERE id=?1",
+                params![persona_id, behavior_md],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn list_personas(&self) -> Result<Value, String> {
@@ -640,6 +689,18 @@ impl Db {
             .ok()
     }
 
+    /// K3：会话创建时的 sandbox 权威档（续聊冲突校验只读本表）
+    pub fn session_sandbox(&self, room_id: &str, persona_id: &str) -> Option<String> {
+        self.0
+            .query_row(
+                "SELECT sandbox FROM room_persona_sessions
+                 WHERE room_id=?1 AND persona_id=?2 AND status='active' AND sandbox IS NOT NULL",
+                params![room_id, persona_id],
+                |r| r.get(0),
+            )
+            .ok()
+    }
+
     /// 落 run（§4.3：UNIQUE(turn_id, persona_id, attempt)；M2a-2 前 turn_id 可空走 INSERT OR REPLACE by id）。
     /// 成功且带 session_id 时维护 room_persona_sessions：换 session 旧值进 archived JSON（可审计）。
     pub fn add_run(
@@ -675,7 +736,8 @@ impl Db {
             .map_err(|e| e.to_string())?;
         if run["status"].as_str() == Some("success") {
             if let Some(session_id) = run["session_id"].as_str() {
-                upsert_session(&self.0, room_id, persona_id, session_id)?;
+                let sb = task_sandbox(task_json);
+                upsert_session(&self.0, room_id, persona_id, session_id, sb.as_deref())?;
             }
         }
         Ok(())
@@ -781,7 +843,8 @@ impl Db {
         let ok = run["status"].as_str() == Some("success");
         if ok {
             if let Some(sid) = run["session_id"].as_str() {
-                upsert_session(&tx, room_id, persona_id, sid)?;
+                let sb = task_sandbox(task_json);
+                upsert_session(&tx, room_id, persona_id, sid, sb.as_deref())?;
             }
         }
         // 气泡（幂等：同 turn 同 persona 只写一次）
@@ -983,13 +1046,21 @@ fn now_plus(secs: i64) -> String {
     }
 }
 
+/// 任务卡里的 sandbox（K3：会话创建时的权限档随 session 记录）
+fn task_sandbox(task_json: &str) -> Option<String> {
+    serde_json::from_str::<Value>(task_json)
+        .ok()
+        .and_then(|t| t["sandbox"].as_str().map(str::to_string))
+}
+
 /// room_persona_sessions 维护：换 session 旧值进 archived JSON（§4.3，不静默替换，可审计）。
-/// 自由函数，供 add_run 与 complete_turn（事务内）共用。
+/// 自由函数，供 add_run 与 complete_turn（事务内）共用。sandbox 随 session 记录（K3 权威档）。
 fn upsert_session(
     conn: &Connection,
     room_id: &str,
     persona_id: &str,
     session_id: &str,
+    sandbox: Option<&str>,
 ) -> Result<(), String> {
     let existing: Option<(String, String)> = conn
         .query_row(
@@ -1004,12 +1075,13 @@ fn upsert_session(
             let mut arr: Vec<Value> = serde_json::from_str(&archived).unwrap_or_default();
             arr.push(json!({"session_id": old, "replaced_at": now()}));
             conn.execute(
-                "UPDATE room_persona_sessions SET session_id=?3, archived=?4, status='active'
+                "UPDATE room_persona_sessions SET session_id=?3, sandbox=?4, archived=?5, status='active'
                  WHERE room_id=?1 AND persona_id=?2",
                 params![
                     room_id,
                     persona_id,
                     session_id,
+                    sandbox,
                     serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
                 ],
             )
@@ -1018,9 +1090,9 @@ fn upsert_session(
         Some(_) => {}
         None => {
             conn.execute(
-                "INSERT INTO room_persona_sessions(room_id,persona_id,session_id,status,created_at)
-                 VALUES(?1,?2,?3,'active',?4)",
-                params![room_id, persona_id, session_id, now()],
+                "INSERT INTO room_persona_sessions(room_id,persona_id,session_id,sandbox,status,created_at)
+                 VALUES(?1,?2,?3,?4,'active',?5)",
+                params![room_id, persona_id, session_id, sandbox, now()],
             )
             .map_err(|e| e.to_string())?;
         }

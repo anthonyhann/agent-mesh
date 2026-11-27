@@ -116,14 +116,51 @@ fn ensure_kernel(app: Option<&tauri::AppHandle>) -> Result<PathBuf, String> {
 // ---------- env doctor ----------
 
 fn login_path() -> String {
-    Command::new("/bin/zsh")
+    let mut p = Command::new("/bin/zsh")
         .args(["-lic", "printf %s \"$PATH\""])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
+        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+    // Dock/launchd 启动时 zsh 初始化可能不带版本管理器目录（nvm/opencode 等），
+    // 这里补常见的用户级 CLI 目录，避免「终端能跑、打包 app 找不到」。
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut extra: Vec<String> = vec![format!("{home}/.opencode/bin")];
+    // nvm：优先 default alias，其次按语义版本取最新
+    let nvm = Path::new(&home).join(".nvm");
+    let alias = fs::read_to_string(nvm.join("alias/default")).ok()
+        .map(|s| s.trim().trim_start_matches('v').to_string())
+        .filter(|s| !s.is_empty());
+    let vers_dir = nvm.join("versions/node");
+    let mut pick: Option<String> = None;
+    if let Ok(rd) = fs::read_dir(&vers_dir) {
+        let mut vers: Vec<(Vec<u64>, String)> = rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().trim_start_matches('v').to_string())
+            .map(|v| {
+                let nums = v.split('.').map(|n| n.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+                (nums, v)
+            })
+            .collect();
+        vers.sort_by(|a, b| a.0.cmp(&b.0));
+        if let Some(al) = alias {
+            pick = vers.iter().find(|(_, v)| v.starts_with(&al)).map(|(_, v)| v.clone())
+                .or_else(|| vers.last().map(|(_, v)| v.clone()));
+        } else {
+            pick = vers.last().map(|(_, v)| v.clone());
+        }
+    }
+    if let Some(v) = pick {
+        extra.push(format!("{}/v{v}/bin", vers_dir.display()));
+    }
+    for d in extra {
+        if Path::new(&d).is_dir() && !p.split(':').any(|x| x == d) {
+            p = format!("{p}:{d}");
+        }
+    }
+    p
 }
 
 fn which_on(path: &str, tool: &str) -> Option<String> {
@@ -178,6 +215,78 @@ struct AppState {
     // M2a-3：在途 run 登记表 + 取消旗标（§6.8 即时打断）
     active: Mutex<HashMap<String, ActiveRun>>,
     cancelled: Mutex<HashSet<String>>,
+    // M2b §4.5 并发矩阵：首轮建会话 per-engine 锁（全局反推无法区分实例，同 engine 全 persona 串行）
+    engine_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// 凭证探测缓存（arkcli auth status 约 2s，60s TTL 防止每轮私聊重复探测）
+    cred_cache: Mutex<HashMap<String, (std::time::Instant, Option<String>)>>,
+}
+
+/// §4.5：首轮建会话需 per-engine 串行的引擎（全局最新会话反推）；arkcli/pi/claude 信封自带 id 可并行
+const SESSION_LOCK_ENGINES: [&str; 5] = ["dsh", "codex", "opencode", "hermes", "qwen"];
+
+/// 凭证前置检查（§4.9 spawn 前 preflight）：缺失返回引导文案，齐全返回 None
+fn credential_guidance(state: &AppState, engine: &str) -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    match engine {
+        "dsh" if !Path::new(&home).join(".dsh/openai-gateway/api-key").exists() => {
+            Some("dsh 网关凭证缺失：请配置 ~/.dsh/openai-gateway/api-key 后重试".into())
+        }
+        "codex" if !Path::new(&home).join(".codex/auth.json").exists() => {
+            Some("codex 未登录：请先在终端运行 codex login（缺少 ~/.codex/auth.json）".into())
+        }
+"claude" => {
+let env_ok = std::env::var("ANTHROPIC_API_KEY").is_ok();
+let file_ok = state.mesh_root.lock().unwrap().join("claude.env").exists();
+if !env_ok && !file_ok {
+Some("claude 未配置 ANTHROPIC_API_KEY：写入数据目录 claude.env 后重试".into())
+} else {
+None
+}
+}
+// arkcli 凭证文件存在不代表可用（SSO refresh_token 会过期），用 auth status 探测，60s 缓存
+"arkcli" => {
+{
+let cache = state.cred_cache.lock().unwrap();
+if let Some((t, cached)) = cache.get("arkcli") {
+if t.elapsed() < std::time::Duration::from_secs(60) {
+return cached.clone();
+}
+}
+}
+let path = state.login_path.lock().unwrap().clone();
+let ok = Command::new("arkcli")
+.args(["auth", "status"])
+.env("PATH", path)
+.output()
+.ok()
+.map(|o| String::from_utf8_lossy(&o.stdout).contains("\"ok\": true")
+    || String::from_utf8_lossy(&o.stdout).contains("\"ok\":true"))
+.unwrap_or(false);
+let guidance = if ok {
+None
+} else {
+Some("arkcli 登录态失效：请在终端运行 arkcli auth login volc-sso 完成登录后重试".into())
+};
+state
+.cred_cache
+.lock()
+.unwrap()
+.insert("arkcli".into(), (std::time::Instant::now(), guidance.clone()));
+guidance
+}
+_ => None,
+    }
+}
+
+/// 权限徽标（§安全：UI 常驻显示各 worker 权限模式标识）
+fn grants_badge(engine: &str, sandbox: Option<&str>) -> String {
+    match engine {
+        "dsh" => "never".into(),
+        "claude" => "bypass".into(),
+        "qwen" => "yolo".into(),
+        "codex" => format!("sandbox: {}", sandbox.unwrap_or("workspace-write")),
+        _ => "default".into(),
+    }
 }
 
 /// 在途 run 登记：stop_turn 按 room 定位 killpg 目标
@@ -447,6 +556,40 @@ fn stop_turn(room_id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<
     }
 }
 
+/// M2b persona 多开（§4.5）：同 engine 新建实例（name 缺省自动编号）
+#[tauri::command]
+fn add_persona(engine: String, name: Option<String>, color: Option<String>, state: tauri::State<'_, Arc<AppState>>) -> Result<Value, String> {
+    Db::open(&state.db_path)?.add_persona(&engine, name.as_deref(), color.as_deref())
+}
+
+/// M2b behavior.md 编辑（联系人名片入口）
+#[tauri::command]
+fn set_behavior(persona_id: String, behavior_md: String, state: tauri::State<'_, Arc<AppState>>) -> Result<Value, String> {
+    Db::open(&state.db_path)?.set_behavior(&persona_id, &behavior_md)?;
+    Ok(json!({"ok": true}))
+}
+
+/// M2b 联系人名片：persona 详情 + 会话/权限徽标/凭证状态（room_id 可选，给了才带会话信息）
+#[tauri::command]
+fn persona_detail(persona_id: String, room_id: Option<String>, state: tauri::State<'_, Arc<AppState>>) -> Result<Value, String> {
+    let db = Db::open(&state.db_path)?;
+    let mut p = db.get_persona(&persona_id)?;
+    let engine = p["engine"].as_str().unwrap_or("").to_string();
+    let (session, sandbox) = match room_id.as_deref() {
+        Some(rid) => (
+            db.last_session(rid, &persona_id),
+            db.session_sandbox(rid, &persona_id),
+        ),
+        None => (None, None),
+    };
+    p["session_id"] = session.map(Value::from).unwrap_or(Value::Null);
+    p["sandbox"] = sandbox.clone().map(Value::from).unwrap_or(Value::Null);
+    p["grants_badge"] = Value::from(grants_badge(&engine, sandbox.as_deref()));
+    p["credential_ok"] = Value::from(credential_guidance(&state, &engine).is_none());
+    p["credential_hint"] = credential_guidance(&state, &engine).map(Value::from).unwrap_or(Value::Null);
+    Ok(p)
+}
+
 /// 发送消息核心（M2a-2：消息+turn 同事务进房间 lane，DM 单成员闭环；群聊调度随 M3）
 fn send_message_core(db: &Db, state: &AppState, room_id: &str, text: &str, client_msg_id: Option<&str>) -> Result<Value, String> {
     // 1) 上下文
@@ -472,7 +615,7 @@ fn send_message_core(db: &Db, state: &AppState, room_id: &str, text: &str, clien
     let session = db.last_session(room_id, &pid);
     let mut task = json!({
         "id": "", "worker": engine, "workspace": cwd,
-        "timeout_seconds": 300, "brief": text,
+        "timeout_seconds": 300, "brief": inject_behavior(&persona, text),
     });
     if let Some(s) = session {
         task["session_id"] = Value::from(s);
@@ -528,11 +671,62 @@ fn execute_turn(
 ) -> Result<Value, String> {
     let run_id = format!("run-{}", db::uuid8());
     task["id"] = Value::from(run_id.clone());
-    if task.get("session_id").is_none() {
+    let resumed = task.get("session_id").is_some();
+    if !resumed {
         if let Some(s) = db.last_session(room_id, persona_id) {
             task["session_id"] = Value::from(s);
         }
     }
+    let has_session = task.get("session_id").is_some();
+    let engine = task["worker"].as_str().unwrap_or("").to_string();
+
+    // K3 冲突校验（§4.5）：续聊任务带的 sandbox 必须等于会话创建时记录的档，不一致 app 侧拒绝派单
+    if engine == "codex" && has_session {
+        if let (Some(recorded), Some(want)) = (
+            db.session_sandbox(room_id, persona_id),
+            task["sandbox"].as_str().map(str::to_string),
+        ) {
+            if recorded != want {
+                let result = json!({
+                    "task_id": run_id, "status": "failed", "answer_text":
+                        format!("该会话创建时为 {recorded}，如需切换请开新会话"),
+                    "error": format!("sandbox conflict: session={recorded} task={want}"),
+                    "synthesized": true,
+                });
+                db.complete_turn(turn_id, room_id, persona_id, &result, &task.to_string(), attempt, &bubble_text(&result))?;
+                if let Some(h) = ev { emit_history(h, room_id); }
+                return Ok(result);
+            }
+        }
+    }
+
+    // 凭证前置（§4.9 spawn 前 preflight）：缺失直接落 skipped 引导泡，不 spawn
+    if let Some(hint) = credential_guidance(state, &engine) {
+        let result = json!({
+            "task_id": run_id, "status": "skipped", "answer_text": hint,
+            "error": "credential missing (preflight)", "synthesized": true,
+        });
+        db.complete_turn(turn_id, room_id, persona_id, &result, &task.to_string(), attempt, &bubble_text(&result))?;
+        if let Some(h) = ev { emit_history(h, room_id); }
+        return Ok(result);
+    }
+
+    // §4.5 并发矩阵：首轮建会话 per-engine 锁（续聊显式 id 可并行）
+    let engine_lock = if !has_session && SESSION_LOCK_ENGINES.contains(&engine.as_str()) {
+        Some(
+            state
+                .engine_locks
+                .lock()
+                .unwrap()
+                .entry(engine.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone(),
+        )
+    } else {
+        None
+    };
+    let _engine_guard = engine_lock.as_ref().map(|l| l.lock().unwrap());
+
     let ctx = LaneCtx {
         room_id: room_id.to_string(),
         persona_id: persona_id.to_string(),
@@ -569,13 +763,23 @@ fn build_rerun_task(db: &Db, action: &Value) -> Value {
                 "worker": persona["engine"].as_str().unwrap_or(""),
                 "workspace": room["cwd"].as_str().unwrap_or(""),
                 "timeout_seconds": 300,
-                "brief": action["brief"].as_str().unwrap_or(""),
+                "brief": inject_behavior(&persona, action["brief"].as_str().unwrap_or("")),
             });
             if persona["engine"].as_str() == Some("codex") {
                 task["sandbox"] = Value::from("read-only");
             }
             task
         })
+}
+
+/// M2b behavior.md 注入（§6.0 渲染回合 prompt）：persona 设了 behavior 就前置于用户原文
+fn inject_behavior(persona: &Value, brief: &str) -> String {
+    let md = persona["behavior_md"].as_str().unwrap_or("").trim();
+    if md.is_empty() {
+        brief.to_string()
+    } else {
+        format!("{md}\n\n---\n\n{brief}")
+    }
 }
 
 /// M2a-3 后台 lane 调度器：每房间串行消费非终态 turn（lane 粒度=turn，房间间并行）。
@@ -685,6 +889,8 @@ fn selftest() -> i32 {
         projects_root: projects_root(),
         active: Mutex::new(HashMap::new()),
         cancelled: Mutex::new(HashSet::new()),
+        engine_locks: Mutex::new(HashMap::new()),
+        cred_cache: Mutex::new(HashMap::new()),
     };
 
     // M1 聊天闭环验收：AGENTCHAT_SELFTEST=chat 用真 dsh 跑两轮对话
@@ -705,6 +911,17 @@ fn selftest() -> i32 {
     // M2a-3 打断验收：AGENTCHAT_SELFTEST=cancel（隔离临时库 + 假 worker SLOW 档）
     if std::env::var("AGENTCHAT_SELFTEST").as_deref() == Ok("cancel") {
         return selftest_cancel(&state);
+    }
+
+    // M2b 验收：AGENTCHAT_SELFTEST=multi（多开隔离 / behavior 注入 / K3 拒单 / 凭证前置，纯 DB 层）
+    if std::env::var("AGENTCHAT_SELFTEST").as_deref() == Ok("multi") {
+        return selftest_multi(&state);
+    }
+
+    // M2b 验收：AGENTCHAT_SELFTEST=dmall（8 engine 各一轮真私聊，真库真 worker；
+    // codex/claude 缺凭证须走 §4.9 前置引导 skipped，其余须 success）
+    if std::env::var("AGENTCHAT_SELFTEST").as_deref() == Ok("dmall") {
+        return selftest_dmall(&state);
     }
 
     // 假 worker 一轮（fake-bin/dsh 须在 PATH 前置目录中）
@@ -869,6 +1086,8 @@ pub fn run() {
                 projects_root: projects_root(),
                 active: Mutex::new(HashMap::new()),
                 cancelled: Mutex::new(HashSet::new()),
+                engine_locks: Mutex::new(HashMap::new()),
+                cred_cache: Mutex::new(HashMap::new()),
             });
             // M2a-2 启动崩溃恢复：只补未完成 persona（补气泡/重跑缺失 run）
             match recover_pending_turns(&state) {
@@ -884,7 +1103,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             doctor, run_task, bind_personas, list_personas, list_rooms, open_dm, room_history,
-            send_message, stop_turn
+            send_message, stop_turn, add_persona, set_behavior, persona_detail
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1161,6 +1380,8 @@ fn selftest_lane(state0: &AppState) -> i32 {
         projects_root: dir.join("projects"),
         active: Mutex::new(HashMap::new()),
         cancelled: Mutex::new(HashSet::new()),
+        engine_locks: Mutex::new(HashMap::new()),
+        cred_cache: Mutex::new(HashMap::new()),
     };
     let db = match Db::open(&db_path) {
         Ok(d) => d,
@@ -1357,6 +1578,8 @@ fn selftest_cancel(state0: &AppState) -> i32 {
         projects_root: dir.join("projects"),
         active: Mutex::new(HashMap::new()),
         cancelled: Mutex::new(HashSet::new()),
+        engine_locks: Mutex::new(HashMap::new()),
+        cred_cache: Mutex::new(HashMap::new()),
     });
     let db = match Db::open(&db_path) {
         Ok(d) => d,
@@ -1444,4 +1667,253 @@ fn selftest_cancel(state0: &AppState) -> i32 {
     let _ = fs::remove_dir_all(&dir);
     println!("[selftest-cancel] PASS");
     0
+}
+
+/// M2b 验收：AGENTCHAT_SELFTEST=multi（隔离临时库，纯 DB/任务卡层，不 spawn）
+/// 1) persona 多开：同 engine 两实例，会话各自隔离不串台（room_persona_sessions 按 room+persona）
+/// 2) behavior.md 注入：设 behavior 后任务卡 brief 前置
+/// 3) K3 sandbox 随 session 记录 + 续聊冲突拒单（app 侧拒绝，不 spawn）
+/// 4) 凭证前置：codex 无 auth.json → skipped 引导泡（本机 ~/.codex/auth.json 缺失时确定触发）
+fn selftest_multi(state0: &AppState) -> i32 {
+    let fail = |msg: &str| {
+        eprintln!("[selftest-multi] FAIL: {msg}");
+        1
+    };
+    let dir = std::env::temp_dir().join(format!("agentchat-multi-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        return fail(&format!("mkdir: {e}"));
+    }
+    let db_path = dir.join("agentchat.db");
+    let state = AppState {
+        mesh_root: Mutex::new(state0.mesh_root.lock().unwrap().clone()),
+        login_path: Mutex::new(state0.login_path.lock().unwrap().clone()),
+        db_path: db_path.clone(),
+        projects_root: dir.join("projects"),
+        active: Mutex::new(HashMap::new()),
+        cancelled: Mutex::new(HashSet::new()),
+        engine_locks: Mutex::new(HashMap::new()),
+        cred_cache: Mutex::new(HashMap::new()),
+    };
+    let db = match Db::open(&db_path) {
+        Ok(d) => d,
+        Err(e) => return fail(&format!("db open: {e}")),
+    };
+
+    // —— 1) persona 多开 + 会话隔离 ——
+    let pa = match db.bind_personas(&["dsh".to_string()]) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("bind_personas: {e}")),
+    };
+    let pa_id = pa[0]["id"].as_str().unwrap_or("").to_string();
+    let pb = match db.add_persona("dsh", None, None) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("add_persona: {e}")),
+    };
+    let pb_id = pb["id"].as_str().unwrap_or("").to_string();
+    if pb_id == pa_id {
+        return fail("add_persona 复用了既有 persona（多开失败）");
+    }
+    if !pb["name"].as_str().unwrap_or("").ends_with('2') {
+        return fail("add_persona 未自动编号命名");
+    }
+    let room_a = match db.open_dm(&pa_id, &state.projects_root) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("open_dm A: {e}")),
+    };
+    let room_b = match db.open_dm(&pb_id, &state.projects_root) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("open_dm B: {e}")),
+    };
+    let ra = room_a["id"].as_str().unwrap_or("").to_string();
+    let rb = room_b["id"].as_str().unwrap_or("").to_string();
+    // A 的会话 sess-A 成功落库；B 的会话 sess-B；互不可见
+    let run_a = json!({"task_id":"run-a1","status":"success","session_id":"sess-A","answer_text":"ok"});
+    if let Err(e) = db.add_run(&run_a, &ra, &pa_id, "{}", None, 1) {
+        return fail(&format!("add_run A: {e}"));
+    }
+    let run_b = json!({"task_id":"run-b1","status":"success","session_id":"sess-B","answer_text":"ok"});
+    if let Err(e) = db.add_run(&run_b, &rb, &pb_id, "{}", None, 1) {
+        return fail(&format!("add_run B: {e}"));
+    }
+    if db.last_session(&ra, &pa_id).as_deref() != Some("sess-A")
+        || db.last_session(&rb, &pb_id).as_deref() != Some("sess-B")
+        || db.last_session(&ra, &pb_id).is_some()
+        || db.last_session(&rb, &pa_id).is_some()
+    {
+        return fail("同 engine 双 persona 会话串台");
+    }
+    println!("[selftest-multi] 1) persona 多开 + 会话隔离 PASS");
+
+    // —— 2) behavior.md 注入 ——
+    if let Err(e) = db.set_behavior(&pa_id, "你是代码评审专家。回复控制在 100 字内。") {
+        return fail(&format!("set_behavior: {e}"));
+    }
+    let p2 = match db.get_persona(&pa_id) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("get_persona: {e}")),
+    };
+    let injected = inject_behavior(&p2, "看下这段代码");
+    if !injected.starts_with("你是代码评审专家") || !injected.ends_with("看下这段代码") {
+        return fail("behavior 未注入 brief");
+    }
+    let plain = inject_behavior(&json!({"behavior_md":""}), "hi");
+    if plain != "hi" {
+        return fail("空 behavior 不应改变 brief");
+    }
+    println!("[selftest-multi] 2) behavior.md 注入 PASS");
+
+    // —— 3) K3：sandbox 随 session 记录 + 冲突拒单 ——
+    let pc = match db.add_persona("codex", None, None) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("add_persona codex: {e}")),
+    };
+    let pc_id = pc["id"].as_str().unwrap_or("").to_string();
+    let room_c = match db.open_dm(&pc_id, &state.projects_root) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("open_dm codex: {e}")),
+    };
+    let rc = room_c["id"].as_str().unwrap_or("").to_string();
+    // 首轮：task sandbox=read-only 建会话 → 权威档记录 read-only
+    let run_c = json!({"task_id":"run-c1","status":"success","session_id":"sess-C","answer_text":"ok"});
+    if let Err(e) = db.add_run(&run_c, &rc, &pc_id, r#"{"sandbox":"read-only"}"#, None, 1) {
+        return fail(&format!("add_run codex: {e}"));
+    }
+    if db.session_sandbox(&rc, &pc_id).as_deref() != Some("read-only") {
+        return fail("K3 sandbox 未随 session 记录");
+    }
+    // 续聊带不一致 sandbox → execute_turn 拒单（不 spawn），turn=failed，气泡为切换引导
+    let (_m, _c, turn_id, created) = match db.add_user_message_turn(&rc, "继续", None, &[pc_id.clone()]) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("add_user_message_turn: {e}")),
+    };
+    if !created {
+        return fail("turn 未创建");
+    }
+    let task = json!({
+        "worker": "codex", "workspace": "/tmp", "timeout_seconds": 60,
+        "brief": "继续", "sandbox": "workspace-write",
+    });
+    if let Err(e) = execute_turn(&db, &state, None, &turn_id, &rc, &pc_id, 1, task) {
+        return fail(&format!("execute_turn: {e}"));
+    }
+    let turn_status: String = db
+        .0
+        .query_row("SELECT status FROM turns WHERE turn_id=?1", rusqlite::params![turn_id], |r| r.get(0))
+        .unwrap_or_default();
+    let bubble: String = db
+        .0
+        .query_row("SELECT text FROM messages WHERE turn_id=?1 AND role='persona'", rusqlite::params![turn_id], |r| r.get(0))
+        .unwrap_or_default();
+    if turn_status != "failed" || !bubble.contains("该会话创建时为 read-only") {
+        return fail("K3 冲突未拒单或引导气泡不符");
+    }
+    println!("[selftest-multi] 3) K3 sandbox 记录 + 冲突拒单 PASS");
+
+    // —— 4) 凭证前置：codex 无 auth.json → skipped 引导泡（不 spawn）——
+    if std::env::var("HOME").map(|h| !Path::new(&h).join(".codex/auth.json").exists()).unwrap_or(false) {
+        // codex 无 auth.json → 续聊前 preflight 命中（K3 一致，sandbox=read-only），落 skipped 引导泡
+        let (_m2, _c2, turn3, _) = match db.add_user_message_turn(&rc, "再来", None, &[pc_id.clone()]) {
+            Ok(v) => v,
+            Err(e) => return fail(&format!("add_user_message_turn3: {e}")),
+        };
+        let task3 = json!({
+            "worker": "codex", "workspace": "/tmp", "timeout_seconds": 60,
+            "brief": "再来", "sandbox": "read-only",
+        });
+        if let Err(e) = execute_turn(&db, &state, None, &turn3, &rc, &pc_id, 1, task3) {
+            return fail(&format!("execute_turn3: {e}"));
+        }
+        let bubble3: String = db
+            .0
+            .query_row("SELECT text FROM messages WHERE turn_id=?1 AND role='persona'", rusqlite::params![turn3], |r| r.get(0))
+            .unwrap_or_default();
+        if !bubble3.contains("codex 未登录") {
+            return fail("凭证前置未产出引导泡");
+        }
+        println!("[selftest-multi] 4) 凭证前置引导泡 PASS");
+    } else {
+        println!("[selftest-multi] 4) 凭证前置（本机 codex 已登录，跳过）");
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+    println!("[selftest-multi] PASS");
+    0
+}
+
+/// M2b 验收：AGENTCHAT_SELFTEST=dmall —— 8 engine 各跑一轮真私聊（真库、真 worker、同步执行）。
+/// 期望：dsh/opencode/hermes/arkcli/qwen/pi 出真回复（success）；
+/// codex/claude 本机缺凭证 → §4.9 前置引导（skipped + 中文引导文案），不 spawn。
+/// 注意：运行前须退出 GUI 实例，避免 lane_dispatcher 并发消费同一真库。
+fn selftest_dmall(state: &AppState) -> i32 {
+    let db = match Db::open(&state.db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[dmall] db open FAILED: {e}");
+            return 1;
+        }
+    };
+    let engines = ["dsh", "codex", "opencode", "hermes", "arkcli", "qwen", "pi", "claude"];
+    let mut fails = 0;
+    for eng in engines {
+        let personas = match db.bind_personas(&[eng.to_string()]) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[dmall] {eng} bind FAILED: {e}");
+                fails += 1;
+                continue;
+            }
+        };
+        let pid = personas[0]["id"].as_str().unwrap_or("").to_string();
+        let room = match db.open_dm(&pid, &state.projects_root) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[dmall] {eng} open_dm FAILED: {e}");
+                fails += 1;
+                continue;
+            }
+        };
+        let room_id = room["id"].as_str().unwrap_or("").to_string();
+        println!("[dmall] {eng}: persona={pid} room={room_id} 发送中…");
+        let h = match send_message_core(&db, state, &room_id, "Reply with exactly one word: PONG. No punctuation.", None) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[dmall] {eng} send FAILED: {e}");
+                fails += 1;
+                continue;
+            }
+        };
+        let last = h
+            .as_array()
+            .and_then(|a| a.iter().filter(|m| m["role"] == "persona").last().cloned());
+        let (status, text) = last
+            .as_ref()
+            .map(|m| {
+                (
+                    m["status"].as_str().unwrap_or("none").to_string(),
+                    m["text"].as_str().unwrap_or("").chars().take(60).collect::<String>(),
+                )
+            })
+            .unwrap_or_else(|| ("none".to_string(), String::new()));
+        let ok = match eng {
+            "codex" => status == "skipped" && text.contains("codex 未登录"),
+            "claude" => status == "skipped" && text.contains("未配置 ANTHROPIC_API_KEY"),
+            "arkcli" => status == "skipped" && text.contains("arkcli 登录态失效"),
+            _ => status == "success",
+        };
+        println!("[dmall] {eng}: status={status} text={text:?}");
+        if ok {
+            println!("[dmall] {eng} PASS");
+        } else {
+            eprintln!("[dmall] {eng} FAIL: 期望与实出不符");
+            fails += 1;
+        }
+    }
+    if fails == 0 {
+        println!("[dmall] PASS (8/8 engines)");
+        0
+    } else {
+        eprintln!("[dmall] FAIL: {fails} engine(s)");
+        1
+    }
 }

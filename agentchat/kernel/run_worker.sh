@@ -6,13 +6,14 @@
 #
 # 任务单 schema v1:
 #   id              必填  结果目录名（results/<id>/）
-#   worker          必填  dsh | codex | opencode | hermes | arkcli
+#   worker          必填  dsh | codex | opencode | hermes | arkcli | claude | qwen | pi
 #   brief           必填  任务描述（传给 worker 的 prompt）
 #   workspace       可选  执行前 cd 到该目录
 #   timeout_seconds 可选  默认 300；超时状态记为 timeout（exit 124）
 #   model           可选  arkcli --model / opencode -m
 #   session_id      可选  dsh --session-id（会话续接）
 #   permission_mode 可选  dsh --permission-mode
+#   sandbox         可选  codex 新会话 -s（默认 workspace-write；会话级不可变，resume 沿用原配置）
 #   profile         可选  arkcli --profile（火山方舟 profile 切换）
 #   max_output_tokens 可选 arkcli --max-output-tokens
 #   done_criteria   可选  {"stdout_regex": "<ERE>"}；缺省判定 exit==0 且 stdout 非空
@@ -58,6 +59,7 @@ emit("T_PERM",     d.get("permission_mode"))
 emit("T_MAXTOK",   d.get("max_output_tokens"))
 emit("T_PROFILE",  d.get("profile"))
 emit("T_PROVIDER", d.get("provider"))
+emit("T_SANDBOX",  d.get("sandbox"))
 emit("T_SCHEMA",   d.get("text_schema"))
 emit("T_THINKING", d.get("thinking"))
 retry = d.get("retry") or {}
@@ -96,7 +98,8 @@ case "$T_WORKER" in
       # 注意：resume 不支持 -s/--sandbox（沿用原 session 配置），可用 --skip-git-repo-check
       CMD=(codex exec resume --skip-git-repo-check "$T_SESSION" "$T_BRIEF")
     else
-      CMD=(codex exec -s workspace-write --skip-git-repo-check "$T_BRIEF")
+      # K3：sandbox 任务字段生效（默认 workspace-write；会话级不可变，resume 不支持 -s）
+      CMD=(codex exec -s "${T_SANDBOX:-workspace-write}" --skip-git-repo-check "$T_BRIEF")
     fi
     ;;
   opencode)

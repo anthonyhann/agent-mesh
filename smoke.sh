@@ -82,7 +82,7 @@ for w in dsh arkcli codex opencode hermes claude qwen pi; do
   if [[ "$w" == "claude" && -z "${ANTHROPIC_API_KEY:-}" && ! -f "$MESH/claude.env" ]]; then
     print -r -- "  ⏭️  claude 未配置 ANTHROPIC_API_KEY（预期内跳过）"; continue
   fi
-  TF=$(ls "$MESH"/tasks/00*-ping-"$w".json 2>/dev/null | head -1)
+  TF=$(ls "$MESH"/examples/tasks/*-ping-"$w".json 2>/dev/null | head -1)
   if [[ -z "$TF" ]]; then
     print -r -- "  ⏭️  $w 无 ping 任务单（跳过）"; continue
   fi

@@ -3,7 +3,11 @@ import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-interface Persona { id: string; engine: string; name: string; color: string; bound: boolean }
+interface Persona { id: string; engine: string; name: string; color: string; bound: boolean; behavior_md?: string }
+interface PersonaDetail extends Persona {
+  session_id?: string | null; sandbox?: string | null;
+  grants_badge: string; credential_ok: boolean; credential_hint?: string | null;
+}
 interface Room {
   id: string; kind: string; name: string; members: string[]; cwd: string;
   permission: string; reply_mode: string;
@@ -56,7 +60,19 @@ const I = {
   clip: <path d="M20.8 11.3 12.3 19.8a5.4 5.4 0 0 1-7.6-7.6l9-9a3.6 3.6 0 0 1 5.1 5.1l-9 9a1.8 1.8 0 0 1-2.5-2.5l8.2-8.2" />,
   send: <path d="M12 18.5v-13M5.8 11.7 12 5.5l6.2 6.2" />,
   stop: <rect x="7" y="7" width="10" height="10" rx="2.5" fill="currentColor" stroke="none" />,
+  copy: <><rect x="8.5" y="8.5" width="11" height="11" rx="2.5" /><path d="M15.5 8.5v-3a2.5 2.5 0 0 0-2.5-2.5h-7a2.5 2.5 0 0 0-2.5 2.5v11a2.5 2.5 0 0 0 2.5 2.5h3" /></>,
 };
+
+/* 权限徽标（与后端 grants_badge 同口径，列表/头部无需详情调用时用） */
+function badgeOf(engine: string, sandbox?: string | null): string {
+  switch (engine) {
+    case "dsh": return "never";
+    case "claude": return "bypass";
+    case "qwen": return "yolo";
+    case "codex": return `sandbox: ${sandbox ?? "workspace-write"}`;
+    default: return "default";
+  }
+}
 
 export default function App() {
   const [personas, setPersonas] = useState<Persona[]>([]);
@@ -65,6 +81,8 @@ export default function App() {
   const [tab, setTab] = useState<"chat" | "contacts">("chat");
   const [showBind, setShowBind] = useState(false);
   const [booted, setBooted] = useState(false);
+  // M2b：联系人名片弹层（persona_id）
+  const [cardId, setCardId] = useState<string | null>(null);
 
   const refreshPersonas = useCallback(async () => {
     const ps = await invoke<Persona[]>("list_personas");
@@ -86,12 +104,13 @@ export default function App() {
     })();
   }, [refreshPersonas, refreshRooms]);
 
-  const openDm = useCallback(async (personaId: string) => {
-    const room = await invoke<Room>("open_dm", { personaId });
-    await refreshRooms();
-    setActiveRoom(room);
-    setTab("chat");
-  }, [refreshRooms]);
+const openDm = useCallback(async (personaId: string) => {
+const room = await invoke<Room>("open_dm", { personaId });
+// 多开的新 persona 也要进列表（否则聊天头部查不到徽标/引擎信息）
+await Promise.all([refreshRooms(), refreshPersonas()]);
+setActiveRoom(room);
+setTab("chat");
+}, [refreshRooms, refreshPersonas]);
 
   if (!booted) return <div className="boot">AgentChat 启动中…</div>;
 
@@ -113,7 +132,8 @@ export default function App() {
             onSelect={(r) => setActiveRoom(r)} onBind={() => setShowBind(true)}
             onCompose={() => setTab("contacts")} />
         ) : (
-          <ContactList personas={personas} onDm={openDm} onBind={() => setShowBind(true)} />
+          <ContactList personas={personas} onDm={openDm} onBind={() => setShowBind(true)}
+            onCard={(id) => setCardId(id)} />
         )}
       </aside>
 
@@ -121,7 +141,7 @@ export default function App() {
       <main className="main">
         {activeRoom ? (
           <ChatView key={activeRoom.id} room={activeRoom} personas={personas}
-            onSent={refreshRooms} />
+            onSent={refreshRooms} onShowCard={(id) => setCardId(id)} />
         ) : (
           <div className="placeholder">
             <div className="ph-logo">🐈‍⬛</div>
@@ -136,6 +156,11 @@ export default function App() {
           setShowBind(false);
           if (done) { await refreshPersonas(); await refreshRooms(); }
         }} />
+      )}
+      {cardId && (
+        <PersonaCard personaId={cardId} roomId={activeRoom?.id ?? null}
+          onClose={async () => { setCardId(null); await refreshPersonas(); await refreshRooms(); }}
+          onDm={(id) => { setCardId(null); openDm(id); }} />
       )}
     </div>
   );
@@ -201,8 +226,8 @@ function fmtListTime(at?: string | null): string {
 
 /* ---------- 联系人 ---------- */
 
-function ContactList({ personas, onDm, onBind }:
-  { personas: Persona[]; onDm: (id: string) => void; onBind: () => void }) {
+function ContactList({ personas, onDm, onBind, onCard }:
+  { personas: Persona[]; onDm: (id: string) => void; onBind: () => void; onCard: (id: string) => void }) {
   return (
     <>
       <div className="sidebar-head"><span className="sb-title">联系人 · {personas.length}</span></div>
@@ -215,8 +240,10 @@ function ContactList({ personas, onDm, onBind }:
             <Avatar name={p.name} color={p.color} />
             <div className="conv-main">
               <div className="conv-top"><span className="conv-name">{p.name}</span></div>
-              <div className="conv-last">{p.engine} · 在线</div>
+              <div className="conv-last">{p.engine} · <span className="badge">{badgeOf(p.engine)}</span> · 在线</div>
             </div>
+            <button className="icon-btn" title="名片"
+              onClick={(e) => { e.stopPropagation(); onCard(p.id); }}><Icon size={15}>{I.more}</Icon></button>
             <span className="online-dot" />
           </div>
         ))}
@@ -279,8 +306,8 @@ function BindWizard({ onClose }: { onClose: (done: boolean) => void }) {
 
 /* ---------- 聊天区 ---------- */
 
-function ChatView({ room, personas, onSent }:
-  { room: Room; personas: Persona[]; onSent: () => void }) {
+function ChatView({ room, personas, onSent, onShowCard }:
+  { room: Room; personas: Persona[]; onSent: () => void; onShowCard: (id: string) => void }) {
   const [history, setHistory] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -371,13 +398,14 @@ function ChatView({ room, personas, onSent }:
     <div className="chat">
       <header className="chat-head">
         {firstPersona && <Avatar name={firstPersona.name} color={firstPersona.color} small />}
-        <div className="ch-meta">
+        <div className="ch-meta clickable" title="查看名片" onClick={() => firstPersona && onShowCard(firstPersona.id)}>
           <div className="ch-name">{room.name}</div>
-          <div className="ch-status"><span className="online-dot" />在线 · {room.permission}</div>
+          <div className="ch-status"><span className="online-dot" />在线 · {room.permission}
+            {firstPersona && <span className="badge">{badgeOf(firstPersona.engine)}</span>}</div>
         </div>
         <div className="ch-actions">
           <button className="icon-btn" title="搜索聊天记录（即将上线）" disabled><Icon size={17}>{I.search}</Icon></button>
-          <button className="icon-btn" title="更多（即将上线）" disabled><Icon size={17}>{I.more}</Icon></button>
+          <button className="icon-btn" title="名片" onClick={() => firstPersona && onShowCard(firstPersona.id)}><Icon size={17}>{I.more}</Icon></button>
         </div>
       </header>
       <div className="bubbles">
@@ -402,6 +430,10 @@ function ChatView({ room, personas, onSent }:
                     <div className="b-name" style={{ color: colorOf(m.sender) }}>{nameOf(m.sender)}</div>
                   )}
                   <pre className="bubble-text">{m.text}</pre>
+                  {/* M2b 失败引导：failed 泡给重发指引；skipped 泡正文已是配置指引 */}
+                  {!me && m.status === "failed" && (
+                    <div className="b-hint">发送失败：检查名片中的凭证状态，或点此消息上方重发</div>
+                  )}
                   <div className="b-foot">
                     {m.tokens != null && <span className="b-meta">⛁ {fmtTok(m.tokens)}</span>}
                     {m.duration_s != null && <span className="b-meta">{Math.round(m.duration_s)}s</span>}
@@ -481,6 +513,81 @@ function Avatar({ name, color, group, small }:
   return (
     <div className={`avatar ${small ? "small" : ""}`} style={{ background: color }}>
       {group ? "群" : name.slice(0, 1)}
+    </div>
+  );
+}
+
+/* ---------- M2b 联系人名片（弹层）：详情 + behavior.md 编辑 + 多开实例 ---------- */
+
+function PersonaCard({ personaId, roomId, onClose, onDm }:
+  { personaId: string; roomId: string | null; onClose: () => void; onDm: (id: string) => void }) {
+  const [d, setD] = useState<PersonaDetail | null>(null);
+  const [md, setMd] = useState("");
+  const [saved, setSaved] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    invoke<PersonaDetail>("persona_detail", { personaId, roomId }).then((v) => {
+      setD(v);
+      setMd(v.behavior_md ?? "");
+    });
+  }, [personaId, roomId]);
+
+  const save = async () => {
+    setBusy(true);
+    await invoke("set_behavior", { personaId, behaviorMd: md });
+    setBusy(false);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+  };
+  // persona 多开（§4.5）：同 engine 新实例，自动编号命名
+  const clone = async () => {
+    if (!d) return;
+    setBusy(true);
+    const p = await invoke<Persona>("add_persona", { engine: d.engine });
+    setBusy(false);
+    onDm(p.id);
+  };
+
+  return (
+    <div className="modal-mask" onClick={onClose}>
+      <div className="wizard card" onClick={(e) => e.stopPropagation()}>
+        {d ? (
+          <>
+            <div className="card-head">
+              <Avatar name={d.name} color={d.color} />
+              <div className="card-title">
+                <div className="card-name">{d.name}</div>
+                <div className="card-sub">{d.engine} · <span className="badge">{d.grants_badge}</span></div>
+              </div>
+              <span className={`cred ${d.credential_ok ? "ok" : "bad"}`}>
+                {d.credential_ok ? "凭证 ✓" : "凭证 ✗"}
+              </span>
+            </div>
+            {!d.credential_ok && d.credential_hint && <div className="cred-hint">{d.credential_hint}</div>}
+            {d.session_id && (
+              <div className="card-row">
+                <span className="card-key">会话</span>
+                <span className="card-val mono">{d.session_id.slice(0, 24)}{d.session_id.length > 24 ? "…" : ""}</span>
+                {d.sandbox && <span className="badge">sandbox: {d.sandbox}</span>}
+              </div>
+            )}
+            <div className="card-row col">
+              <span className="card-key">behavior.md（身份/风格/何时不发言/篇幅/禁推理外露）</span>
+              <textarea className="behavior" rows={6} value={md} onChange={(e) => setMd(e.target.value)}
+                placeholder="例：你是代码评审专家。回复控制在 100 字内。不主动评价无关话题。" />
+            </div>
+            <div className="card-actions">
+              <button className="primary" disabled={busy} onClick={save}>{saved ? "已保存 ✓" : "保存 behavior"}</button>
+              <button className="ghost" disabled={busy} onClick={clone} title="同引擎再开一个实例（会话独立）">
+                <Icon size={14}>{I.copy}</Icon> 再开一个实例
+              </button>
+            </div>
+          </>
+        ) : (
+          <div className="empty">加载中…</div>
+        )}
+      </div>
     </div>
   );
 }
