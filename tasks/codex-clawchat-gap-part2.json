@@ -1,0 +1,9 @@
+{
+  "id": "codex-clawchat-gap-part2",
+  "worker": "codex",
+  "workspace": "/www/github/agent-mesh",
+  "sandbox": "workspace-write",
+  "timeout_seconds": 1800,
+  "done_criteria": { "stdout_regex": "GAP-ANALYSIS-DONE" },
+  "brief": "你是资深产品+架构分析师。续写一份已完成前四章的对比分析文档。\n\n# 现状\n/www/github/agent-mesh/docs/clawchat-gap-analysis.md 已写好 §0 证据口径、§1 ClawChat 完整功能/体验清单、§2 AgentChat 现状对照、§3 差距矩阵（表格含：功能点 | ClawChat 证据 | 我们现状 | 差距 | 优先级 P0/P1/P2 | 建议里程碑 M3a~M5）。上次进程被杀，§4-§6 缺失。先通读全文（尤其 §3 矩阵的每一行），再续写。\n\n# 你的任务：在同一文件末尾追加三节（不要改动已有内容）\n## 4. 中国版优化建议\n基于 §3 矩阵，面向中国单机用户：中文 IM 习惯（微信式交互细节：引用回复、撤回、消息免打扰、输入中提示、时间分割线、未读角标）、国内 CLI 引擎生态（dsh/arkcli/qwen/pi/opencode/hermes/codex/claude 八引擎并存是中国特色）、凭证与失败引导体验（国内 SSO/API key 现状）、隐私本地化卖点（数据不出机）。每条建议引用 §3 矩阵中的相关行号或功能点。\n## 5. 自有能力迭代建议\n我们独有差异化如何放大：多 harness 引擎矩阵（8 engine 是 ClawChat 没有的）、persona 多开（同 engine 多联系人）、engine 并发锁、凭证前置引导、Tauri 原生桌面、dispatcher 管线（run_pipeline/run_dag）、session.html 子会话时间线。每项给出迭代方向与落地里程碑。\n## 6. 行动路线\n把 §3 矩阵全部 P0/P1 项排进 M3a 群聊房间 / M3b 权限快照 / M4a 接话 / M4b 记忆摘要 / M4c EXP / M5 发布，每项一句话实现要点；用表格：里程碑 | 事项 | 优先级 | 实现要点 | 依赖。最后给一段「M3a 开工清单」（下周可立即执行的有序列表）。\n\n# 纪律\n- 只修改 docs/clawchat-gap-analysis.md（append 模式），不碰其他文件；两个 ClawChat 仓库只读。\n- 风格与已有章节一致（中文、表格、证据引用格式 `H:path:line` / `A:path:line` / `I:path:line`）。\n- 新增断言仍需证据；推演性建议标注「建议」。\n- 完成后在 stdout 最后一行单独打印：GAP-ANALYSIS-DONE"
+}

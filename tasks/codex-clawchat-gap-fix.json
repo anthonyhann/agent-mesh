@@ -1,0 +1,10 @@
+{
+  "id": "codex-clawchat-gap-fix",
+  "worker": "codex",
+  "workspace": "/www/github/agent-mesh",
+  "sandbox": "workspace-write",
+  "timeout_seconds": 1800,
+  "session_id": "01a21da4-9e1a-7193-aec6-5ba7ad7878e0",
+  "done_criteria": { "stdout_regex": "FIX-APPLIED" },
+  "brief": "你的文档 /www/github/agent-mesh/docs/clawchat-gap-analysis.md 刚被第二引擎复核，结论 FIX。复核报告全文在 /Users/hanqiang/.catpaw/desk_default_workspace/agent-mesh/results/dsh-clawchat-gap-review/stdout.txt，先通读。\n\n# 任务：应用复核报告「必须修改项清单」全部 11 项到文档（1-10 必改，11 建议项也执行：L507 降 P1）\n要点摘要（以复核报告原文为准）：\n1. 修 3 处越界引用（agent-protocol.md 行号，改用正确小节行号）；\n2. 修 2 处小错（tool_grants.py:47→:48；plugin.yaml 表述改「55 个工具（53 个 clawchat_* + 2 个 chat_history_*）」）；\n3. L548 附件/凭据 denylist P0→P1，挂 P0 前置，72 项门禁同步改为 71/36/35/14；\n4. L497 拆两条：thinking/中间状态抑制 → P0/M3a；流式分块渲染 → 保留 P2；\n5. 统一 EXP/榜单/race 口径：在 §3 明写「移出 v2.0.0 验收范围，契约 §9 M4c/M5 定义需同步修订」；\n6. §6.8 第 1 条改「§6.2 32 行 = 4 回归 + 28 新建」；\n7. §6.8 第 2 条补 recover_scan 必须先判 lease_until/active 否则 300ms 重复派发；\n8. §6.8 调序：群设置面板（muted/reply_mode）前移到 mention 闭环之前；\n9. §1 补 3 个 P0 遗漏模块：turn_attachments（出站证据，H:clawchat_gateway/turn_attachments.py）、media-boundaries（SSRF/公网单播，H:docs/media-boundaries.md + media_runtime.py）、prompt-injection（untrusted 标注，H:docs/reference/prompt-injection.md），并同步进 §3 矩阵（P0）与 §6 排期；\n10. L551 补注：DM 现无条件 codex read-only，与契约 §6.4 冲突，M3a 需同步改为显式选择；\n11. L507 每群项目文件夹 P0→P1。\n\n# 纪律\n- 只改 docs/clawchat-gap-analysis.md；改完后全文的计数（72→71、M3a 项数等）必须自洽，§0/§6 的数字同步更新。\n- 新增引用必须先打开源码核对行号再写。\n- 改完在文末追加一行：「> v1.1：已吸收第二引擎复核（dsh）11 项修订，结论 FIX→PASS 待确认。」\n- stdout 最后一行单独打印：FIX-APPLIED"
+}

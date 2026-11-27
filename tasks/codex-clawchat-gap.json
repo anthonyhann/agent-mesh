@@ -1,0 +1,9 @@
+{
+  "id": "codex-clawchat-gap",
+  "worker": "codex",
+  "workspace": "/www/github/agent-mesh",
+  "sandbox": "workspace-write",
+  "timeout_seconds": 3600,
+  "done_criteria": {"stdout_regex": "GAP-ANALYSIS-DONE"},
+  "brief": "你是资深产品+架构分析师。任务：对 ClawChat（官方源码）与我们的 AgentChat 实现做【最完整】的对比分析，产出一份差距分析与落地路线文档。\n\n# 背景\n我们把 ClawChat 复刻为中国单机版「圆桌派 AgentChat」：Tauri 2 桌面 app，把本机 CLI agent 绑定为 IM 联系人，私聊续聊+群聊主动接话+EXP。目标：① 完整复刻 ClawChat 的功能和体验；② 在此之上做中国版优化调整；③ 迭代自有能力。\n\n# 材料（全部本地）\n- ClawChat 官方宿主插件源码（只读）：/www/github/clawchat-plugin-hermes-agent（main@ac00c73）\n- ClawChat 官方安装 CLI 源码（只读）：/www/github/clawchat-plugin-install-cli（871a619）\n- 我们的设计契约：/www/github/agent-mesh/docs/design-agentchat.md（v2.4，含 §0 修订记录、§0.2 已有 C1-C6 纠偏、§4 事实源/事实表、§6 群回合、roadmap M0-M5，M0~M2b 已实施并打勾）\n- 我们的实现：/www/github/agent-mesh/agentchat/src-tauri/src/lib.rs（commands/lane/execute_turn/凭证前置/并发锁/selftest）、db.rs（schema）、src/App.tsx（IM 前端）、src/styles.css；内核 /www/github/agent-mesh/run_worker.sh\n\n# 输出\n写入唯一文件：/www/github/agent-mesh/docs/clawchat-gap-analysis.md（中文）。结构：\n1. **ClawChat 完整功能/体验清单**：基于源码逐模块梳理——消息模型/lane、房间与成员、群聊闸门与 coalescer、@与定向派发、接话 chain、权限 grants 与审批、记忆三域、滚动摘要、EXP/榜单、typing/presence、race、技能与 livewares、CLI 命令面、安装绑定流程、UX 细节（交互/文案/节奏）。每个功能点必须带源码证据（file:line）。\n2. **AgentChat 现状对照**：按 M0~M2b 已实现清单逐项对照（有/部分/无）。\n3. **差距矩阵**：表格：功能点 | ClawChat 证据 | 我们现状 | 差距 | 复刻优先级（P0=完整复刻必须 / P1=体验对齐 / P2=可选）| 建议落地里程碑（对齐 M3a 群聊房间 / M3b 权限快照 / M4a 接话 / M4b 记忆摘要 / M4c EXP / M5 发布）。\n4. **中国版优化建议**：中文 IM 习惯（微信式交互细节）、国内 CLI 引擎生态（dsh/arkcli/qwen/pi/opencode/hermes/codex/claude 八引擎）、凭证与失败引导体验、隐私本地化卖点等。\n5. **自有能力迭代建议**：我们独有的差异化（多 harness 引擎矩阵、persona 多开、engine 并发锁、凭证前置引导、Tauri 原生桌面体验等）如何继续放大。\n6. **行动路线**：把 P0/P1 项排进 M3a~M5，给出每项一句话实现要点。\n\n# 纪律\n- 两个 ClawChat 仓库只读，不修改；只写 docs/clawchat-gap-analysis.md 一个文件。\n- 所有 ClawChat 功能断言必须有源码 file:line 证据，禁止凭印象写。\n- §0.2 C1-C6 是已吸收的旧调研，不要简单复述，要补全它没覆盖的面（UX 细节、CLI 面、安装流、livewares、事件/状态细节等）。\n- 文档要充分完整（不设上限，写到真正覆盖为止）。\n- 完成后在 stdout 最后一行单独打印：GAP-ANALYSIS-DONE"
+}

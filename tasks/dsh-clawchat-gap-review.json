@@ -1,0 +1,8 @@
+{
+  "id": "dsh-clawchat-gap-review",
+  "worker": "dsh",
+  "workspace": "/www/github/agent-mesh",
+  "timeout_seconds": 1800,
+  "done_criteria": { "stdout_regex": "REVIEW-DONE" },
+  "brief": "你是挑剔的技术评审。复核一份刚完成的差距分析文档：/www/github/agent-mesh/docs/clawchat-gap-analysis.md（ClawChat × AgentChat 差距分析与落地路线，含 §0-§6）。\n\n# 复核材料（全部本地）\n- ClawChat 官方宿主插件源码（只读）：/www/github/clawchat-plugin-hermes-agent\n- ClawChat 官方安装 CLI 源码（只读）：/www/github/clawchat-plugin-install-cli\n- 我们的设计契约：/www/github/agent-mesh/docs/design-agentchat.md\n- 我们的实现：/www/github/agent-mesh/agentchat/（src-tauri/src/lib.rs、db.rs、src/App.tsx）\n\n# 复核维度（逐项给结论）\n1. **证据真实性**：抽查至少 15 处 `H:`/`I:`/`A:` 引用（file:line），打开源码核对是否存在、是否支持文档断言。列出任何对不上的引用。\n2. **覆盖完整性**：对照 ClawChat 源码目录（clawchat_gateway/、prompts/、skills/、docs/、plugin.yaml、packages/、livewares/），找文档遗漏的重要功能模块。\n3. **优先级合理性**：§3 矩阵的 P0/P1/P2 定级是否有误判（如把复刻必须项定成 P2，或把不适用项定成 P0）。\n4. **行动路线可执行性**：§6 的 M3a~M5 排期是否与设计契约 roadmap 一致，「M3a 开工清单」是否真的能直接开工。\n5. **结论**：PASS（可直接作为 M3+ 输入）/ FIX（需修订，列出必须修改项清单）。\n\n# 输出\n直接 stdout 输出复核报告（中文，markdown），不写任何文件。结构：## 证据抽查（表：引用 | 核对结果）/ ## 遗漏模块 / ## 优先级异议 / ## 路线意见 / ## 结论。最后一行单独打印：REVIEW-DONE"
+}
