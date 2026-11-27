@@ -816,7 +816,11 @@ impl Db {
                 |r| r.get(0),
             )
             .map_err(|e| e.to_string())?;
-        let (status, last_err): (&str, Option<String>) = if !ok {
+        // turn 终态：cancelled 即 cancelled（§6.8）；失败即 failed；全部目标 success 才 done
+        let cancelled = run["status"].as_str() == Some("cancelled");
+        let (status, last_err): (&str, Option<String>) = if cancelled {
+            ("cancelled", Some("cancelled by user".into()))
+        } else if !ok {
             ("failed", Some(format!("{} run failed", persona_id)))
         } else if success_n >= targets.len() as i64 {
             ("done", None)
@@ -831,6 +835,17 @@ impl Db {
             .map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// M2a-3：调度器领取 turn（claimed → running，仅领取状态迁移）
+    pub fn mark_turn_running(&self, turn_id: &str) -> Result<(), String> {
+        self.0
+            .execute(
+                "UPDATE turns SET status='running' WHERE turn_id=?1 AND status='claimed'",
+                params![turn_id],
+            )
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 

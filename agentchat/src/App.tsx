@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 interface Persona { id: string; engine: string; name: string; color: string; bound: boolean }
 interface Room {
@@ -54,6 +55,7 @@ const I = {
   bolt: <path d="M13 2.5 4.5 14H11l-1 7.5L18.5 10H12l1-7.5z" />,
   clip: <path d="M20.8 11.3 12.3 19.8a5.4 5.4 0 0 1-7.6-7.6l9-9a3.6 3.6 0 0 1 5.1 5.1l-9 9a1.8 1.8 0 0 1-2.5-2.5l8.2-8.2" />,
   send: <path d="M12 18.5v-13M5.8 11.7 12 5.5l6.2 6.2" />,
+  stop: <rect x="7" y="7" width="10" height="10" rx="2.5" fill="currentColor" stroke="none" />,
 };
 
 export default function App() {
@@ -282,6 +284,8 @@ function ChatView({ room, personas, onSent }:
   const [history, setHistory] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  // M2a-3：typing 事件驱动（persona_id → 最后节拍时间），不再用本地 sending 模拟
+  const [typing, setTyping] = useState<Record<string, number>>({});
   const bottomRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
 
@@ -289,7 +293,39 @@ function ChatView({ room, personas, onSent }:
     setHistory(await invoke<Msg[]>("room_history", { roomId: room.id }));
   }, [room.id]);
   useEffect(() => { refresh(); }, [refresh]);
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [history, sending]);
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [history, typing]);
+
+  // M2a-3 异步事件：typing start/beat/end（C6 节奏）+ history（气泡入库刷新）
+  useEffect(() => {
+    let unTyping: (() => void) | undefined;
+    let unHist: (() => void) | undefined;
+    listen<{ room_id: string; persona_id: string; phase: string }>("ac://typing", (e) => {
+      const p = e.payload;
+      if (p.room_id !== room.id) return;
+      setTyping((prev) => {
+        const n = { ...prev };
+        if (p.phase === "end") delete n[p.persona_id];
+        else n[p.persona_id] = Date.now();
+        return n;
+      });
+    }).then((u) => { unTyping = u; });
+    listen<{ room_id: string }>("ac://history", (e) => {
+      if (e.payload.room_id === room.id) { refresh(); onSent(); }
+    }).then((u) => { unHist = u; });
+    return () => { unTyping?.(); unHist?.(); };
+  }, [room.id, refresh, onSent]);
+
+  // C6：6s 无节拍自动熄灭（事件丢失兜底）
+  useEffect(() => {
+    const t = setInterval(() => {
+      setTyping((prev) => {
+        const now = Date.now();
+        const n = Object.fromEntries(Object.entries(prev).filter(([, ts]) => now - ts < 6000));
+        return Object.keys(n).length === Object.keys(prev).length ? prev : n;
+      });
+    }, 1000);
+    return () => clearInterval(t);
+  }, []);
 
   const nameOf = (sender: string) =>
     sender === "user" ? "我" : personas.find((p) => p.id === sender)?.name ?? sender;
@@ -298,6 +334,8 @@ function ChatView({ room, personas, onSent }:
 
   // client_msg_id：每次发送自铸，重试沿用 → UNIQUE(room_id, client_msg_id) 幂等（§4.11）
   const pendingIdRef = useRef<string | null>(null);
+  // M2a-3 异步：send_message 只入队（消息+turn 同事务）即返回自己的消息回显；
+  // 执行由后端 lane 调度器消费，typing/气泡/取消均由事件驱动
   const send = async () => {
     const text = input.trim();
     if (!text || sending) return;
@@ -312,6 +350,11 @@ function ChatView({ room, personas, onSent }:
     } catch {
       setInput(text); // 失败回填，重试沿用同一 client_msg_id
     } finally { setSending(false); }
+  };
+  // §6.8 即时打断：停止当前回合（killpg → run cancelled → lane 继续消费下一 turn）
+  const stop = async () => {
+    await invoke("stop_turn", { roomId: room.id });
+    setTyping({}); // 本地立即熄灭（后端 typing end 事件兜底）
   };
 
   const grow = () => {
@@ -374,12 +417,15 @@ function ChatView({ room, personas, onSent }:
             </div>
           );
         })}
-        {sending && (
-          <div className="bubble-row">
-            {firstPersona && <Avatar name={firstPersona.name} color={firstPersona.color} small />}
-            <div className="bubble last typing"><span /><span /><span /></div>
-          </div>
-        )}
+        {Object.keys(typing).map((pid) => {
+          const p = personas.find((x) => x.id === pid);
+          return (
+            <div key={pid} className="bubble-row">
+              {p ? <Avatar name={p.name} color={p.color} small /> : <div className="avatar-sp" />}
+              <div className="bubble last typing"><span /><span /><span /></div>
+            </div>
+          );
+        })}
         <div ref={bottomRef} />
       </div>
       <div className="composer">
@@ -391,6 +437,9 @@ function ChatView({ room, personas, onSent }:
             onChange={(e) => { setInput(e.target.value); grow(); }}
             onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
         </div>
+        {Object.keys(typing).length > 0 && (
+          <button className="stop" title="停止当前回合" onClick={stop}><Icon size={13}>{I.stop}</Icon></button>
+        )}
         <button className="send" disabled={sending || !input.trim()} onClick={send}><Icon size={17}>{I.send}</Icon></button>
       </div>
     </div>

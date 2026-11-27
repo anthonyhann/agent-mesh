@@ -1,4 +1,5 @@
 // AgentChat M0 后端：双根复制 · env doctor · sidecar spawn · watchdog(§4.8)
+// M2a-3：send_message 异步化（入队即返回）+ 后台 lane 调度器 + typing 事件（C6）+ §6.8 即时打断
 //
 // 路径契约（design-agentchat.md §3）：
 //   只读源  Contents/Resources/kernel/（dev 时回退 <manifest>/../kernel）
@@ -7,11 +8,12 @@
 // sidecar Contents/MacOS/mesh-run-<triple>（dev 时回退 target/debug/mesh-run）
 
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::Manager;
@@ -135,7 +137,7 @@ fn which_on(path: &str, tool: &str) -> Option<String> {
 }
 
 #[tauri::command]
-fn doctor(state: tauri::State<'_, AppState>) -> Value {
+fn doctor(state: tauri::State<'_, Arc<AppState>>) -> Value {
     let root = state.mesh_root.lock().unwrap().clone();
     let path = state.login_path.lock().unwrap().clone();
     let tools = [
@@ -173,6 +175,22 @@ struct AppState {
     login_path: Mutex<String>,
     db_path: PathBuf,
     projects_root: PathBuf,
+    // M2a-3：在途 run 登记表 + 取消旗标（§6.8 即时打断）
+    active: Mutex<HashMap<String, ActiveRun>>,
+    cancelled: Mutex<HashSet<String>>,
+}
+
+/// 在途 run 登记：stop_turn 按 room 定位 killpg 目标
+struct ActiveRun {
+    #[allow(dead_code)]
+    pgid: u32,
+    room_id: String,
+}
+
+/// lane 执行上下文：typing 事件归属 + 在途登记
+struct LaneCtx {
+    room_id: String,
+    persona_id: String,
 }
 
 fn resolve_result(root: &Path, id: &str) -> Value {
@@ -202,11 +220,16 @@ fn killpg(pgid: u32, sig: i32) {
 }
 
 #[tauri::command]
-fn run_task(task: Value, state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    run_task_impl(task, &state)
+fn run_task(task: Value, state: tauri::State<'_, Arc<AppState>>) -> Result<Value, String> {
+    run_task_impl(task, &**state, None, None)
 }
 
-fn run_task_impl(task: Value, state: &AppState) -> Result<Value, String> {
+fn run_task_impl(
+    task: Value,
+    state: &AppState,
+    ev: Option<&tauri::AppHandle>,
+    ctx: Option<&LaneCtx>,
+) -> Result<Value, String> {
     let id = task
         .get("id")
         .and_then(Value::as_str)
@@ -253,7 +276,7 @@ fn run_task_impl(task: Value, state: &AppState) -> Result<Value, String> {
 // M0 假 worker 通道：仅 AGENTCHAT_SELFTEST=1|slow|lane 时允许 fake-bin 前置 PATH，
 // 避免污染真实聊天/正常使用中的 CLI 解析
 let st = std::env::var("AGENTCHAT_SELFTEST").unwrap_or_default();
-if st == "1" || st == "slow" || st == "lane" {
+if st == "1" || st == "slow" || st == "lane" || st == "cancel" {
 let fake = mesh_data().join("fake-bin");
 if fake.is_dir() {
 let p = format!("{}:{}", fake.display(), state.login_path.lock().unwrap());
@@ -263,6 +286,13 @@ cmd.env("PATH", p);
 
     let mut child: Child = cmd.spawn().map_err(|e| format!("spawn sidecar: {e}"))?;
     let pgid = child.id();
+    // §6.8 在途登记：stop_turn 按 room 定位 killpg 目标
+    if let Some(c) = ctx {
+        state.active.lock().unwrap().insert(
+            id.clone(),
+            ActiveRun { pgid, room_id: c.room_id.clone() },
+        );
+    }
 
     // stdout/stderr 异步抽干，防管道缓冲撑满后子进程阻塞
     if let Some(out) = child.stdout.take() {
@@ -276,25 +306,58 @@ cmd.env("PATH", p);
         });
     }
 
-    // watchdog 轮询
+    // watchdog 轮询（含 §6.8 取消检查 + C6 typing 节拍 ≤1.5s/次）
     let start = Instant::now();
-    let outcome = loop {
+    let mut last_beat = Instant::now();
+    let outcome: Result<i32, &str> = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status.code().unwrap_or(1)),
             Ok(None) => {
+                if state.cancelled.lock().unwrap().contains(&id) {
+                    // §6.8 即时打断：SIGTERM → ≤5s → SIGKILL
+                    killpg(pgid, libc::SIGTERM);
+                    let grace = Instant::now();
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) => {
+                                if grace.elapsed() > Duration::from_secs(5) {
+                                    let _ = child.kill(); // 兜底
+                                    killpg(pgid, libc::SIGKILL);
+                                    let _ = child.wait();
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(100));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    break Err("cancelled");
+                }
                 if start.elapsed() > budget {
                     killpg(pgid, libc::SIGTERM);
                     thread::sleep(Duration::from_secs(5));
                     let _ = child.kill(); // 兜底
                     killpg(pgid, libc::SIGKILL);
                     let _ = child.wait();
-                    break Err(());
+                    break Err("timeout");
+                }
+                // typing 节拍：在途节流刷新（C6 ≤1.5s/次，前端 6s 无刷新自动熄灭）
+                if let (Some(h), Some(c)) = (ev, ctx) {
+                    if last_beat.elapsed() >= Duration::from_millis(1500) {
+                        emit_typing(h, &c.room_id, &c.persona_id, "beat");
+                        last_beat = Instant::now();
+                    }
                 }
                 thread::sleep(Duration::from_millis(200));
             }
             Err(e) => return Err(format!("wait: {e}")),
         }
     };
+    if ctx.is_some() {
+        state.active.lock().unwrap().remove(&id);
+        state.cancelled.lock().unwrap().remove(&id);
+    }
 
     let result_dir = root.join("results").join(&id);
     match outcome {
@@ -302,15 +365,20 @@ cmd.env("PATH", p);
             // K0 原子写保证此处 result.json 要么完整要么不存在
             Ok(resolve_result(&root, &id))
         }
-        Err(()) => {
-            // 合成 timeout 记录（§4.8）：清理 running 标记，不伪造内核语义
+        Err(kind) => {
+            // 合成 timeout/cancelled 记录（§4.8/§6.8）：清理 running 标记，不伪造内核语义
             let _ = fs::remove_file(result_dir.join("running"));
             let answer = fs::read_to_string(result_dir.join("answer.txt")).unwrap_or_default();
+            let error = if kind == "cancelled" {
+                "cancelled by user (§6.8 killpg)".to_string()
+            } else {
+                format!("watchdog killpg after budget {}s", budget.as_secs())
+            };
             Ok(json!({
-                "task_id": id, "status": "timeout", "synthesized": true,
+                "task_id": id, "status": kind, "synthesized": true,
                 "duration_s": start.elapsed().as_secs(),
                 "answer_text": answer,
-                "error": format!("watchdog killpg after budget {}s", budget.as_secs()),
+                "error": error,
             }))
         }
     }
@@ -320,34 +388,63 @@ cmd.env("PATH", p);
 // DB 连接每次调用独立打开（SQLite WAL 多连接），无跨命令锁竞争
 
 #[tauri::command]
-fn bind_personas(engines: Vec<String>, state: tauri::State<'_, AppState>) -> Result<Value, String> {
+fn bind_personas(engines: Vec<String>, state: tauri::State<'_, Arc<AppState>>) -> Result<Value, String> {
     Db::open(&state.db_path)?.bind_personas(&engines)
 }
 
 #[tauri::command]
-fn list_personas(state: tauri::State<'_, AppState>) -> Result<Value, String> {
+fn list_personas(state: tauri::State<'_, Arc<AppState>>) -> Result<Value, String> {
     Db::open(&state.db_path)?.list_personas()
 }
 
 #[tauri::command]
-fn list_rooms(state: tauri::State<'_, AppState>) -> Result<Value, String> {
+fn list_rooms(state: tauri::State<'_, Arc<AppState>>) -> Result<Value, String> {
     Db::open(&state.db_path)?.list_rooms()
 }
 
 #[tauri::command]
-fn open_dm(persona_id: String, state: tauri::State<'_, AppState>) -> Result<Value, String> {
+fn open_dm(persona_id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<Value, String> {
     Db::open(&state.db_path)?.open_dm(&persona_id, &state.projects_root)
 }
 
 #[tauri::command]
-fn room_history(room_id: String, state: tauri::State<'_, AppState>) -> Result<Value, String> {
+fn room_history(room_id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<Value, String> {
     Db::open(&state.db_path)?.room_history(&room_id, 200)
 }
 
 #[tauri::command]
-fn send_message(room_id: String, text: String, client_msg_id: Option<String>, state: tauri::State<'_, AppState>) -> Result<Value, String> {
+fn send_message(room_id: String, text: String, client_msg_id: Option<String>, state: tauri::State<'_, Arc<AppState>>) -> Result<Value, String> {
+    // M2a-3 异步化：消息+turn 同事务进 lane 即返回（§6.2.1）；执行由后台调度器消费，UI 事件驱动
     let db = Db::open(&state.db_path)?;
-    send_message_core(&db, &state, &room_id, &text, client_msg_id.as_deref())
+    let room = db.get_room(&room_id)?;
+    let targets: Vec<String> = room["members"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    db.add_user_message_turn(&room_id, &text, client_msg_id.as_deref(), &targets)?;
+    db.room_history(&room_id, 200)
+}
+
+/// §6.8 即时打断：停止该房间在途 run（killpg SIGTERM→≤5s→SIGKILL → cancelled 合成记录）
+#[tauri::command]
+fn stop_turn(room_id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<Value, String> {
+    let rid = state
+        .active
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, a)| a.room_id == room_id)
+        .map(|(k, _)| k.clone());
+    match rid {
+        Some(rid) => {
+            state.cancelled.lock().unwrap().insert(rid.clone());
+            Ok(json!({"stopping": true, "run_id": rid}))
+        }
+        None => Ok(json!({"stopping": false})),
+    }
 }
 
 /// 发送消息核心（M2a-2：消息+turn 同事务进房间 lane，DM 单成员闭环；群聊调度随 M3）
@@ -373,9 +470,8 @@ fn send_message_core(db: &Db, state: &AppState, room_id: &str, text: &str, clien
 
     // 3) 任务卡（§4.1；session 续接；codex 安全模式字段预置，K3 落地后生效）
     let session = db.last_session(room_id, &pid);
-    let run_id = format!("run-{}", db::uuid8());
     let mut task = json!({
-        "id": run_id, "worker": engine, "workspace": cwd,
+        "id": "", "worker": engine, "workspace": cwd,
         "timeout_seconds": 300, "brief": text,
     });
     if let Some(s) = session {
@@ -386,22 +482,155 @@ fn send_message_core(db: &Db, state: &AppState, room_id: &str, text: &str, clien
     }
 
     // 4) 执行 + 完成事务（§4.3：run+气泡+turn 终态单事务；执行失败也落 failed 终态，不悬挂 turn）
-    let result = run_task_impl(task.clone(), state).unwrap_or_else(|e| json!({
-        "task_id": run_id, "status": "failed", "answer_text": "", "error": e,
-    }));
-    let bubble = bubble_text(&result);
-    db.complete_turn(&turn_id, room_id, &pid, &result, &task.to_string(), 1, &bubble)?;
+    execute_turn(db, state, None, &turn_id, room_id, &pid, 1, task)?;
     db.room_history(room_id, 200)
 }
 
-/// 气泡文本：无正文输出时落状态占位（与 M1 行为一致）
+/// 气泡文本：无正文输出时落状态占位（cancelled 落「已停止」，其余与 M1 行为一致）
 fn bubble_text(result: &Value) -> String {
     let status = result["status"].as_str().unwrap_or("failed");
     let answer = result["answer_text"].as_str().unwrap_or("");
     if answer.is_empty() {
-        format!("[{status}]（无正文输出）")
+        if status == "cancelled" {
+            "[cancelled] 已停止".to_string()
+        } else {
+            format!("[{status}]（无正文输出）")
+        }
     } else {
         answer.to_string()
+    }
+}
+
+/// UI 事件（M2a-3）：typing start/beat/end（C6 节奏）与 history（气泡入库通知）
+fn emit_typing(app: &tauri::AppHandle, room_id: &str, persona_id: &str, phase: &str) {
+    use tauri::Emitter;
+    let _ = app.emit(
+        "ac://typing",
+        json!({"room_id": room_id, "persona_id": persona_id, "phase": phase}),
+    );
+}
+fn emit_history(app: &tauri::AppHandle, room_id: &str) {
+    use tauri::Emitter;
+    let _ = app.emit("ac://history", json!({"room_id": room_id}));
+}
+
+/// 执行一个 turn 的单 persona run：任务卡定型（新 run_id、session 注入）→ 可取消执行 → §4.3 完成事务。
+/// ev 存在时发 typing(start/end)+history 事件（M2a-3 异步链路）；selftest/启动恢复传 None。
+fn execute_turn(
+    db: &Db,
+    state: &AppState,
+    ev: Option<&tauri::AppHandle>,
+    turn_id: &str,
+    room_id: &str,
+    persona_id: &str,
+    attempt: i64,
+    mut task: Value,
+) -> Result<Value, String> {
+    let run_id = format!("run-{}", db::uuid8());
+    task["id"] = Value::from(run_id.clone());
+    if task.get("session_id").is_none() {
+        if let Some(s) = db.last_session(room_id, persona_id) {
+            task["session_id"] = Value::from(s);
+        }
+    }
+    let ctx = LaneCtx {
+        room_id: room_id.to_string(),
+        persona_id: persona_id.to_string(),
+    };
+    if let Some(h) = ev {
+        emit_typing(h, room_id, persona_id, "start");
+    }
+    let result = run_task_impl(task.clone(), state, ev, Some(&ctx)).unwrap_or_else(|e| json!({
+        "task_id": run_id, "status": "failed", "answer_text": "", "error": e,
+    }));
+    let bubble = bubble_text(&result);
+    db.complete_turn(turn_id, room_id, persona_id, &result, &task.to_string(), attempt, &bubble)?;
+    if let Some(h) = ev {
+        emit_typing(h, room_id, persona_id, "end");
+        emit_history(h, room_id);
+    }
+    Ok(result)
+}
+
+/// rerun 动作的任务卡：快照优先；无快照（崩溃在 run 创建前/新 turn）按触发原文重建
+fn build_rerun_task(db: &Db, action: &Value) -> Value {
+    action
+        .get("task_json")
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| {
+            let room = db
+                .get_room(action["room_id"].as_str().unwrap_or(""))
+                .unwrap_or(Value::Null);
+            let persona = db
+                .get_persona(action["persona_id"].as_str().unwrap_or(""))
+                .unwrap_or(Value::Null);
+            let mut task = json!({
+                "worker": persona["engine"].as_str().unwrap_or(""),
+                "workspace": room["cwd"].as_str().unwrap_or(""),
+                "timeout_seconds": 300,
+                "brief": action["brief"].as_str().unwrap_or(""),
+            });
+            if persona["engine"].as_str() == Some("codex") {
+                task["sandbox"] = Value::from("read-only");
+            }
+            task
+        })
+}
+
+/// M2a-3 后台 lane 调度器：每房间串行消费非终态 turn（lane 粒度=turn，房间间并行）。
+/// 复用 recover_scan 动作清单：backfill 内联补写（幂等），rerun 派 worker 线程（每房间每 tick 一个）；
+/// inflight 以 room 为粒度防重入，头阻塞即 lane 串行。取消后 turn 终态化，下一 tick 自动消费下一 turn。
+fn lane_dispatcher(app: tauri::AppHandle, state: Arc<AppState>) {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut inflight: HashSet<String> = HashSet::new();
+    loop {
+        while let Ok(room) = rx.try_recv() {
+            inflight.remove(&room);
+        }
+        if let Ok(db) = Db::open(&state.db_path) {
+            if let Ok(actions) = db.recover_scan() {
+                let mut dispatched: HashSet<String> = HashSet::new();
+                for a in actions {
+                    let room = a["room_id"].as_str().unwrap_or("").to_string();
+                    let turn = a["turn_id"].as_str().unwrap_or("").to_string();
+                    let pid = a["persona_id"].as_str().unwrap_or("").to_string();
+                    let attempt = a["attempt"].as_i64().unwrap_or(1);
+                    match a["action"].as_str().unwrap_or("") {
+                        "backfill" => {
+                            let run = a["run"].clone();
+                            if db
+                                .complete_turn(&turn, &room, &pid, &run, "{}", attempt, &bubble_text(&run))
+                                .is_ok()
+                            {
+                                emit_history(&app, &room);
+                            }
+                        }
+                        "rerun" => {
+                            if inflight.contains(&room) || dispatched.contains(&room) {
+                                continue;
+                            }
+                            dispatched.insert(room.clone());
+                            inflight.insert(room.clone());
+                            let _ = db.mark_turn_running(&turn);
+                            let task = build_rerun_task(&db, &a);
+                            let st = state.clone();
+                            let h = app.clone();
+                            let txc = tx.clone();
+                            let room2 = room.clone();
+                            thread::spawn(move || {
+                                if let Ok(db2) = Db::open(&st.db_path) {
+                                    let _ = execute_turn(&db2, &st, Some(&h), &turn, &room2, &pid, attempt, task);
+                                }
+                                let _ = txc.send(room2);
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(300));
     }
 }
 
@@ -424,33 +653,8 @@ fn recover_pending_turns(state: &AppState) -> Result<usize, String> {
                 n += 1;
             }
             "rerun" => {
-                // 快照优先；无快照（崩溃在 run 创建前）按触发原文重建任务卡
-                let mut task: Value = a
-                    .get("task_json")
-                    .and_then(Value::as_str)
-                    .and_then(|s| serde_json::from_str(s).ok())
-                    .unwrap_or_else(|| {
-                        let room = db.get_room(room_id).unwrap_or(Value::Null);
-                        let persona = db.get_persona(pid).unwrap_or(Value::Null);
-                        json!({
-                            "worker": persona["engine"].as_str().unwrap_or(""),
-                            "workspace": room["cwd"].as_str().unwrap_or(""),
-                            "timeout_seconds": 300,
-                            "brief": a["brief"].as_str().unwrap_or(""),
-                        })
-                    });
-                let run_id = format!("run-{}", db::uuid8());
-                task["id"] = Value::from(run_id.clone());
-                if task.get("session_id").is_none() {
-                    if let Some(s) = db.last_session(room_id, pid) {
-                        task["session_id"] = Value::from(s);
-                    }
-                }
-                let result = run_task_impl(task.clone(), state).unwrap_or_else(|e| json!({
-                    "task_id": run_id, "status": "failed", "answer_text": "", "error": e,
-                }));
-                let bubble = bubble_text(&result);
-                db.complete_turn(turn_id, room_id, pid, &result, &task.to_string(), attempt, &bubble)?;
+                let task = build_rerun_task(&db, &a);
+                execute_turn(&db, state, None, turn_id, room_id, pid, attempt, task)?;
                 n += 1;
             }
             _ => {}
@@ -479,6 +683,8 @@ fn selftest() -> i32 {
         login_path: Mutex::new(path),
         db_path: mesh_data().join("agentchat.db"),
         projects_root: projects_root(),
+        active: Mutex::new(HashMap::new()),
+        cancelled: Mutex::new(HashSet::new()),
     };
 
     // M1 聊天闭环验收：AGENTCHAT_SELFTEST=chat 用真 dsh 跑两轮对话
@@ -496,6 +702,11 @@ fn selftest() -> i32 {
         return selftest_lane(&state);
     }
 
+    // M2a-3 打断验收：AGENTCHAT_SELFTEST=cancel（隔离临时库 + 假 worker SLOW 档）
+    if std::env::var("AGENTCHAT_SELFTEST").as_deref() == Ok("cancel") {
+        return selftest_cancel(&state);
+    }
+
     // 假 worker 一轮（fake-bin/dsh 须在 PATH 前置目录中）
     let slow = std::env::var("AGENTCHAT_SELFTEST").as_deref() == Ok("slow");
     let id = format!("m0-selftest-{}", std::process::id());
@@ -510,7 +721,7 @@ fn selftest() -> i32 {
             "brief": "fake ping from selftest", "timeout_seconds": 60,
         })
     };
-    let r = run_task_impl(task, &state);
+    let r = run_task_impl(task, &state, None, None);
     match r {
         Ok(v) => {
             println!("[selftest] run_task={}", serde_json::to_string_pretty(&v).unwrap());
@@ -651,24 +862,29 @@ pub fn run() {
             let path = login_path();
             let db_path = mesh_data().join("agentchat.db");
             Db::open(&db_path)?; // 提前触发 migrate
-            let state = AppState {
+            let state = Arc::new(AppState {
                 mesh_root: Mutex::new(root),
                 login_path: Mutex::new(path),
                 db_path,
                 projects_root: projects_root(),
-            };
+                active: Mutex::new(HashMap::new()),
+                cancelled: Mutex::new(HashSet::new()),
+            });
             // M2a-2 启动崩溃恢复：只补未完成 persona（补气泡/重跑缺失 run）
             match recover_pending_turns(&state) {
                 Ok(n) if n > 0 => eprintln!("[agentchat] startup recovery: {n} action(s) replayed"),
                 Ok(_) => {}
                 Err(e) => eprintln!("[agentchat] startup recovery failed: {e}"),
             }
-            app.manage(state);
+            app.manage(state.clone());
+            // M2a-3 后台 lane 调度器：每房间串行消费 turn，事件驱动 UI
+            let handle = app.handle().clone();
+            thread::spawn(move || lane_dispatcher(handle, state));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             doctor, run_task, bind_personas, list_personas, list_rooms, open_dm, room_history,
-            send_message
+            send_message, stop_turn
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -943,6 +1159,8 @@ fn selftest_lane(state0: &AppState) -> i32 {
         login_path: Mutex::new(state0.login_path.lock().unwrap().clone()),
         db_path: db_path.clone(),
         projects_root: dir.join("projects"),
+        active: Mutex::new(HashMap::new()),
+        cancelled: Mutex::new(HashSet::new()),
     };
     let db = match Db::open(&db_path) {
         Ok(d) => d,
@@ -1115,5 +1333,115 @@ fn selftest_lane(state0: &AppState) -> i32 {
 
     let _ = fs::remove_dir_all(&dir);
     println!("[selftest-lane] PASS (4 cases)");
+    0
+}
+
+/// M2a-3 验收：§6.8 即时打断（隔离临时库 + 假 worker SLOW 档）
+/// 断言：取消旗标 → killpg 合成 cancelled 记录（耗时远小于假 worker 的 30s 睡眠）；
+/// turn 终态 cancelled；run 落库 cancelled；气泡「[cancelled] 已停止」。
+fn selftest_cancel(state0: &AppState) -> i32 {
+    let fail = |msg: &str| {
+        eprintln!("[selftest-cancel] FAIL: {msg}");
+        1
+    };
+    let dir = std::env::temp_dir().join(format!("agentchat-cancel-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        return fail(&format!("mkdir: {e}"));
+    }
+    let db_path = dir.join("agentchat.db");
+    let state = Arc::new(AppState {
+        mesh_root: Mutex::new(state0.mesh_root.lock().unwrap().clone()),
+        login_path: Mutex::new(state0.login_path.lock().unwrap().clone()),
+        db_path: db_path.clone(),
+        projects_root: dir.join("projects"),
+        active: Mutex::new(HashMap::new()),
+        cancelled: Mutex::new(HashSet::new()),
+    });
+    let db = match Db::open(&db_path) {
+        Ok(d) => d,
+        Err(e) => return fail(&format!("db open: {e}")),
+    };
+    let personas = match db.bind_personas(&["dsh".to_string()]) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("bind_personas: {e}")),
+    };
+    let pid = personas[0]["id"].as_str().unwrap_or("").to_string();
+    let room = match db.open_dm(&pid, &state.projects_root) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("open_dm: {e}")),
+    };
+    let room_id = room["id"].as_str().unwrap_or("").to_string();
+    let cwd = room["cwd"].as_str().unwrap_or("").to_string();
+    let (_m, _c, turn_id, _) =
+        match db.add_user_message_turn(&room_id, "SLOW cancel me", None, &[pid.clone()]) {
+            Ok(v) => v,
+            Err(e) => return fail(&format!("turn: {e}")),
+        };
+    println!("[selftest-cancel] room={room_id} turn={turn_id}");
+
+    // worker 线程跑 turn（假 worker SLOW 档睡 30s）
+    let (st2, dbp2, room2, pid2, turn2) =
+        (state.clone(), db_path.clone(), room_id.clone(), pid.clone(), turn_id.clone());
+    let cwd2 = cwd.clone();
+    let worker = thread::spawn(move || {
+        let db2 = Db::open(&dbp2)?;
+        let task = json!({
+            "worker": "dsh", "workspace": cwd2,
+            "timeout_seconds": 300, "brief": "SLOW cancel me",
+        });
+        execute_turn(&db2, &st2, None, &turn2, &room2, &pid2, 1, task)
+    });
+
+    // 等 run 登记 active → 置取消旗标（模拟 stop_turn）
+    let t0 = Instant::now();
+    let mut rid: Option<String> = None;
+    while t0.elapsed() < Duration::from_secs(3) {
+        if let Some(k) = state.active.lock().unwrap().keys().next().cloned() {
+            rid = Some(k);
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let Some(rid) = rid else {
+        return fail("run 未登记 active（stop_turn 找不到目标）");
+    };
+    println!("[selftest-cancel] cancelling {rid}");
+    state.cancelled.lock().unwrap().insert(rid);
+
+    let res = match worker.join() {
+        Ok(v) => v,
+        Err(_) => return fail("worker join panic"),
+    };
+    let result = match res {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("execute_turn: {e}")),
+    };
+    let elapsed = t0.elapsed().as_secs();
+    println!("[selftest-cancel] done in {elapsed}s, status={}", result["status"]);
+    if result["status"].as_str() != Some("cancelled") {
+        return fail("结果非 cancelled");
+    }
+    if elapsed > 15 {
+        return fail("取消耗时超限（killpg 未生效）");
+    }
+    let turn_status: String = db
+        .0
+        .query_row("SELECT status FROM turns WHERE turn_id=?1", rusqlite::params![turn_id], |r| r.get(0))
+        .unwrap_or_default();
+    let run_status: String = db
+        .0
+        .query_row("SELECT status FROM runs WHERE turn_id=?1", rusqlite::params![turn_id], |r| r.get(0))
+        .unwrap_or_default();
+    let bubble: String = db
+        .0
+        .query_row("SELECT text FROM messages WHERE turn_id=?1 AND role='persona'", rusqlite::params![turn_id], |r| r.get(0))
+        .unwrap_or_default();
+    println!("[selftest-cancel] turn={turn_status}, run={run_status}, bubble={bubble:?}");
+    if turn_status != "cancelled" || run_status != "cancelled" || bubble != "[cancelled] 已停止" {
+        return fail("终态/记录/气泡不符预期");
+    }
+    let _ = fs::remove_dir_all(&dir);
+    println!("[selftest-cancel] PASS");
     0
 }

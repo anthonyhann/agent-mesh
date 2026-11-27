@@ -251,6 +251,16 @@ input, textarea { font: inherit; }
 .send:not(:disabled):hover { background: var(--accent-hover); }
 .send:not(:disabled):active { transform: scale(.88); }
 .send:disabled { background: var(--fill); color: var(--sub-2); cursor: default; box-shadow: none; }
+/* §6.8 停止按钮：systemRed 圆形 + 白色方块 */
+.stop {
+  width: 34px; height: 34px; border-radius: 50%; background: var(--danger); color: #fff;
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  margin-bottom: 2px;
+  transition: transform .12s, background .15s;
+  box-shadow: 0 2px 8px rgba(255,105,97,.35);
+}
+.stop:hover { background: #ff7b72; }
+.stop:active { transform: scale(.88); }
 
 /* ============ 绑定向导弹层 ============ */
 .modal-mask {
